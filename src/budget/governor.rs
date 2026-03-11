@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::errors::BudgetError;
 use crate::models::{BackendId, MoneyAmount, ProjectId, TaskId};
@@ -232,6 +233,7 @@ impl BudgetGovernor {
         }
     }
 
+    #[instrument(skip(self, request), fields(backend = %request.backend_id, mode = ?self.config.mode))]
     pub async fn evaluate(
         &self,
         request: &BudgetEvaluationRequest,

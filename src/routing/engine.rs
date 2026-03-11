@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tracing::instrument;
+
 use crate::adapters::traits::AdapterRegistry;
 use crate::budget::governor::{BudgetAction, BudgetEvaluationRequest, BudgetGovernor};
 use crate::errors::{BackendEvaluation, RoutingError};
@@ -80,6 +82,7 @@ impl RoutingEngine {
         }
     }
 
+    #[instrument(skip(self, request), fields(task_type = ?request.task_type, project_id = %request.project_id))]
     pub async fn route(&self, request: RoutingRequest) -> Result<RoutingDecision, RoutingError> {
         let mut evaluations = Vec::new();
 

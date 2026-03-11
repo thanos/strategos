@@ -119,21 +119,29 @@ async fn fake_adapter_fails() {
 
 #[tokio::test]
 async fn skeleton_adapters_return_unsupported() {
-    let claude = ClaudeAdapter::new(ClaudeConfig::default());
-    assert!(matches!(
-        claude.submit(test_request()).await,
-        Err(AdapterError::Unsupported(_))
-    ));
-
-    let ollama = OllamaAdapter::new(OllamaConfig::default());
-    assert!(matches!(
-        ollama.submit(test_request()).await,
-        Err(AdapterError::Unsupported(_))
-    ));
-
+    // OpenCode is still a skeleton
     let opencode = OpenCodeAdapter::new(OpenCodeConfig::default());
     assert!(matches!(
         opencode.submit(test_request()).await,
         Err(AdapterError::Unsupported(_))
     ));
+}
+
+#[tokio::test]
+async fn claude_adapter_returns_auth_error_without_key() {
+    let claude = ClaudeAdapter::new(ClaudeConfig {
+        api_key_env: "STRATEGOS_TEST_NONEXISTENT_KEY".into(),
+        ..ClaudeConfig::default()
+    });
+    assert!(matches!(
+        claude.submit(test_request()).await,
+        Err(AdapterError::AuthenticationFailed(_))
+    ));
+}
+
+#[tokio::test]
+async fn ollama_adapter_returns_error_without_server() {
+    let ollama = OllamaAdapter::new(OllamaConfig::default());
+    let result = ollama.submit(test_request()).await;
+    assert!(result.is_err());
 }

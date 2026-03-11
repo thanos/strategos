@@ -334,6 +334,25 @@ fn cmd_budget(config: &GlobalConfig) -> Result<()> {
         }
     }
 
+    // Forecast
+    let forecast = crate::budget::forecast::BudgetForecast::compute(
+        summary.global_spent,
+        summary.global_limit,
+    );
+    println!("\nForecast:");
+    println!("  Daily burn rate: {}/day", forecast.daily_burn_rate);
+    println!("  Projected EOM: {}", forecast.projected_spend);
+    if forecast.projected_overspend {
+        println!("  WARNING: projected to exceed budget!");
+    }
+    if let Some(days) = forecast.days_until_exhaustion {
+        if days == 0 {
+            println!("  Budget EXHAUSTED");
+        } else {
+            println!("  Days until exhaustion: {}", days);
+        }
+    }
+
     Ok(())
 }
 
