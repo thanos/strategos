@@ -87,7 +87,7 @@ impl FakeAdapter {
         }
     }
 
-    fn full_capabilities() -> AdapterCapabilities {
+    pub fn full_capabilities() -> AdapterCapabilities {
         AdapterCapabilities {
             code_editing: true,
             shell_tool_use: true,

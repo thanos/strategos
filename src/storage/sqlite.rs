@@ -1,11 +1,20 @@
 use std::path::Path;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
+use crate::budget::governor::UsageStore;
+use crate::errors::BudgetError;
 use crate::errors::StorageError;
+use crate::models::event::{Event, EventType};
+use crate::models::policy::{ActionStatus, PendingAction, PendingActionType};
 use crate::models::project::Project;
-use crate::models::{BackendId, MoneyAmount, ProjectId, PrivacyLevel};
+use crate::models::task::{Task, TaskStatus};
+use crate::models::usage::UsageRecord;
+use crate::models::{
+    ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
+};
 
 use super::schema::SCHEMA_V1;
 
@@ -16,8 +25,14 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     /// Open or create a database at the given path and apply migrations.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::Database(format!("cannot create directory: {}", e)))?;
+        }
         let conn =
             Connection::open(path).map_err(|e| StorageError::Database(e.to_string()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let storage = Self { conn };
         storage.migrate()?;
         Ok(storage)
@@ -27,13 +42,14 @@ impl SqliteStorage {
     pub fn in_memory() -> Result<Self, StorageError> {
         let conn =
             Connection::open_in_memory().map_err(|e| StorageError::Database(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         let storage = Self { conn };
         storage.migrate()?;
         Ok(storage)
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
-        // Check current version
         let has_migrations = self
             .conn
             .query_row(
@@ -70,11 +86,13 @@ impl SqliteStorage {
         Ok(())
     }
 
-    // -- Project CRUD -------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Project CRUD
+    // -----------------------------------------------------------------------
 
     pub fn insert_project(&self, project: &Project) -> Result<(), StorageError> {
-        let tags_json =
-            serde_json::to_string(&project.tags).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let tags_json = serde_json::to_string(&project.tags)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let privacy_str = serde_json::to_string(&project.privacy)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
@@ -125,10 +143,39 @@ impl SqliteStorage {
         }
     }
 
+    pub fn get_project_by_name(&self, name: &str) -> Result<Option<Project>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, path, privacy, tags, created_at, updated_at FROM projects WHERE name = ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![name], |row| {
+                Ok(ProjectRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    privacy: row.get(3)?,
+                    tags: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        match result {
+            Some(row) => Ok(Some(row.into_project()?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_projects(&self) -> Result<Vec<Project>, StorageError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, privacy, tags, created_at, updated_at FROM projects")
+            .prepare("SELECT id, name, path, privacy, tags, created_at, updated_at FROM projects ORDER BY name")
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -168,8 +215,151 @@ impl SqliteStorage {
         Ok(())
     }
 
-    // -- Usage queries ------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Task CRUD
+    // -----------------------------------------------------------------------
 
+    pub fn insert_task(&self, task: &Task) -> Result<(), StorageError> {
+        let task_type_str = serde_json::to_string(&task.task_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let priority_str = serde_json::to_string(&task.priority)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let status_str = serde_json::to_string(&task.status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let override_str = task.backend_override.as_ref().map(|b| b.as_str().to_string());
+
+        self.conn
+            .execute(
+                "INSERT INTO tasks (id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    task.id.0.to_string(),
+                    task.project_id.0.to_string(),
+                    task_type_str,
+                    task.description,
+                    priority_str,
+                    status_str,
+                    override_str,
+                    task.created_at.to_rfc3339(),
+                    task.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at
+                 FROM tasks WHERE id = ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![id.0.to_string()], |row| {
+                Ok(TaskRow {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    task_type: row.get(2)?,
+                    description: row.get(3)?,
+                    priority: row.get(4)?,
+                    status: row.get(5)?,
+                    backend_override: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        match result {
+            Some(row) => Ok(Some(row.into_task()?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_tasks_by_project(&self, project_id: &ProjectId) -> Result<Vec<Task>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at
+                 FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![project_id.0.to_string()], |row| {
+                Ok(TaskRow {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    task_type: row.get(2)?,
+                    description: row.get(3)?,
+                    priority: row.get(4)?,
+                    status: row.get(5)?,
+                    backend_override: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            tasks.push(row.into_task()?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn update_task_status(
+        &self,
+        id: &TaskId,
+        status: TaskStatus,
+    ) -> Result<(), StorageError> {
+        let status_str = serde_json::to_string(&status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status_str, Utc::now().to_rfc3339(), id.0.to_string()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!("task {}", id)));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage records
+    // -----------------------------------------------------------------------
+
+    pub fn insert_usage(&self, record: &UsageRecord) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                "INSERT INTO usage_records (id, task_id, project_id, backend_id, input_tokens, output_tokens, cost_cents, model, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.id.0.to_string(),
+                    record.task_id.0.to_string(),
+                    record.project_id.0.to_string(),
+                    record.backend_id.as_str(),
+                    record.input_tokens as i64,
+                    record.output_tokens as i64,
+                    record.cost.cents,
+                    record.model,
+                    record.recorded_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Keep the old string-based insert for backwards compatibility with existing tests.
     pub fn insert_usage_record(
         &self,
         id: &str,
@@ -192,7 +382,6 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Total spend for the given month (YYYY-MM prefix match on recorded_at).
     pub fn total_spend_month(&self, year_month: &str) -> Result<MoneyAmount, StorageError> {
         let cents: i64 = self
             .conn
@@ -205,7 +394,6 @@ impl SqliteStorage {
         Ok(MoneyAmount::from_cents(cents))
     }
 
-    /// Spend for a specific backend in the given month.
     pub fn backend_spend_month(
         &self,
         backend_id: &BackendId,
@@ -222,7 +410,6 @@ impl SqliteStorage {
         Ok(MoneyAmount::from_cents(cents))
     }
 
-    /// Spend for a specific project in the given month.
     pub fn project_spend_month(
         &self,
         project_id: &ProjectId,
@@ -238,9 +425,366 @@ impl SqliteStorage {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(MoneyAmount::from_cents(cents))
     }
+
+    // -----------------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------------
+
+    pub fn insert_event(&self, event: &Event) -> Result<(), StorageError> {
+        let event_type_str = serde_json::to_string(&event.event_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let payload_str = serde_json::to_string(&event.payload)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        self.conn
+            .execute(
+                "INSERT INTO events (id, event_type, project_id, task_id, payload, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event.id.0.to_string(),
+                    event_type_str,
+                    event.project_id.as_ref().map(|p| p.0.to_string()),
+                    event.task_id.as_ref().map(|t| t.0.to_string()),
+                    payload_str,
+                    event.timestamp.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_events_recent(&self, limit: usize) -> Result<Vec<Event>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, event_type, project_id, task_id, payload, timestamp
+                 FROM events ORDER BY timestamp DESC LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            events.push(row.into_event()?);
+        }
+        Ok(events)
+    }
+
+    pub fn list_events_by_project(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<Event>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, event_type, project_id, task_id, payload, timestamp
+                 FROM events WHERE project_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![project_id.0.to_string(), limit as i64], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            events.push(row.into_event()?);
+        }
+        Ok(events)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending actions
+    // -----------------------------------------------------------------------
+
+    pub fn insert_pending_action(&self, action: &PendingAction) -> Result<(), StorageError> {
+        let action_type_str = serde_json::to_string(&action.action_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let status_str = serde_json::to_string(&action.status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let payload_str = serde_json::to_string(&action.payload)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        self.conn
+            .execute(
+                "INSERT INTO pending_actions (id, action_type, project_id, task_id, description, payload, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    action.id.0.to_string(),
+                    action_type_str,
+                    action.project_id.0.to_string(),
+                    action.task_id.as_ref().map(|t| t.0.to_string()),
+                    action.description,
+                    payload_str,
+                    status_str,
+                    action.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_pending_actions(&self) -> Result<Vec<PendingAction>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action_type, project_id, task_id, description, payload, status, created_at
+                 FROM pending_actions WHERE status = '\"Pending\"' ORDER BY created_at",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingActionRow {
+                    id: row.get(0)?,
+                    action_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    description: row.get(4)?,
+                    payload: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut actions = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            actions.push(row.into_pending_action()?);
+        }
+        Ok(actions)
+    }
+
+    pub fn update_action_status(
+        &self,
+        id: &ActionId,
+        status: ActionStatus,
+    ) -> Result<(), StorageError> {
+        let status_str = serde_json::to_string(&status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE pending_actions SET status = ?1 WHERE id = ?2",
+                params![status_str, id.0.to_string()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!("action {}", id.0)));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing history
+    // -----------------------------------------------------------------------
+
+    pub fn insert_routing_history(
+        &self,
+        task_id: &TaskId,
+        selected_backend: &str,
+        reason: &str,
+        fallback_applied: bool,
+        budget_downgrade_applied: bool,
+    ) -> Result<(), StorageError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO routing_history (id, task_id, selected_backend, reason, fallback_applied, budget_downgrade_applied, decided_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    task_id.0.to_string(),
+                    selected_backend,
+                    reason,
+                    fallback_applied as i32,
+                    budget_downgrade_applied as i32,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
 }
 
-// Internal helper for mapping rows
+/// Thread-safe storage wrapper using a Mutex around the Connection.
+/// Implements the budget governor's `UsageStore` trait for production use.
+pub struct ThreadSafeStorage {
+    conn: std::sync::Mutex<Connection>,
+}
+
+impl ThreadSafeStorage {
+    pub fn open(path: &Path) -> Result<Self, StorageError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::Database(format!("cannot create directory: {}", e)))?;
+        }
+        let conn =
+            Connection::open(path).map_err(|e| StorageError::Database(e.to_string()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let storage = Self {
+            conn: std::sync::Mutex::new(conn),
+        };
+        storage.migrate()?;
+        Ok(storage)
+    }
+
+    pub fn in_memory() -> Result<Self, StorageError> {
+        let conn =
+            Connection::open_in_memory().map_err(|e| StorageError::Database(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let storage = Self {
+            conn: std::sync::Mutex::new(conn),
+        };
+        storage.migrate()?;
+        Ok(storage)
+    }
+
+    fn migrate(&self) -> Result<(), StorageError> {
+        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let has_migrations = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_migrations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let current_version = if has_migrations > 0 {
+            conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if current_version < 1 {
+            conn.execute_batch(SCHEMA_V1)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                params![1, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn current_year_month() -> String {
+        Utc::now().format("%Y-%m").to_string()
+    }
+
+    pub fn total_spend_month(&self, year_month: &str) -> Result<MoneyAmount, StorageError> {
+        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let cents: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_cents), 0) FROM usage_records WHERE recorded_at LIKE ?1",
+                params![format!("{}%", year_month)],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(MoneyAmount::from_cents(cents))
+    }
+
+    pub fn backend_spend_month(
+        &self,
+        backend_id: &BackendId,
+        year_month: &str,
+    ) -> Result<MoneyAmount, StorageError> {
+        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let cents: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_cents), 0) FROM usage_records WHERE backend_id = ?1 AND recorded_at LIKE ?2",
+                params![backend_id.as_str(), format!("{}%", year_month)],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(MoneyAmount::from_cents(cents))
+    }
+
+    pub fn project_spend_month(
+        &self,
+        project_id: &ProjectId,
+        year_month: &str,
+    ) -> Result<MoneyAmount, StorageError> {
+        let conn = self.conn.lock().map_err(|e| StorageError::Database(e.to_string()))?;
+        let cents: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_cents), 0) FROM usage_records WHERE project_id = ?1 AND recorded_at LIKE ?2",
+                params![project_id.0.to_string(), format!("{}%", year_month)],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(MoneyAmount::from_cents(cents))
+    }
+}
+
+#[async_trait]
+impl UsageStore for ThreadSafeStorage {
+    async fn total_spend_current_month(&self) -> Result<MoneyAmount, BudgetError> {
+        let ym = Self::current_year_month();
+        self.total_spend_month(&ym)
+            .map_err(|e| BudgetError::Storage(e.to_string()))
+    }
+
+    async fn backend_spend_current_month(
+        &self,
+        backend: &BackendId,
+    ) -> Result<MoneyAmount, BudgetError> {
+        let ym = Self::current_year_month();
+        self.backend_spend_month(backend, &ym)
+            .map_err(|e| BudgetError::Storage(e.to_string()))
+    }
+
+    async fn project_spend_current_month(
+        &self,
+        project: &ProjectId,
+    ) -> Result<MoneyAmount, BudgetError> {
+        let ym = Self::current_year_month();
+        self.project_spend_month(project, &ym)
+            .map_err(|e| BudgetError::Storage(e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row mapping helpers
+// ---------------------------------------------------------------------------
+
 struct ProjectRow {
     id: String,
     name: String,
@@ -285,6 +829,145 @@ impl ProjectRow {
     }
 }
 
+struct TaskRow {
+    id: String,
+    project_id: String,
+    task_type: String,
+    description: String,
+    priority: String,
+    status: String,
+    backend_override: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TaskRow {
+    fn into_task(self) -> Result<Task, StorageError> {
+        let id = uuid::Uuid::parse_str(&self.id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let project_id = uuid::Uuid::parse_str(&self.project_id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let task_type: TaskType = serde_json::from_str(&self.task_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let priority: Priority = serde_json::from_str(&self.priority)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let status: TaskStatus = serde_json::from_str(&self.status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let backend_override = self.backend_override.map(BackendId::new);
+        let created_at = chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            .with_timezone(&Utc);
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&self.updated_at)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            .with_timezone(&Utc);
+
+        Ok(Task {
+            id: TaskId(id),
+            project_id: ProjectId(project_id),
+            task_type,
+            description: self.description,
+            priority,
+            status,
+            backend_override,
+            created_at,
+            updated_at,
+        })
+    }
+}
+
+struct EventRow {
+    id: String,
+    event_type: String,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    payload: Option<String>,
+    timestamp: String,
+}
+
+impl EventRow {
+    fn into_event(self) -> Result<Event, StorageError> {
+        let id = uuid::Uuid::parse_str(&self.id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let event_type: EventType = serde_json::from_str(&self.event_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let project_id = self
+            .project_id
+            .map(|s| uuid::Uuid::parse_str(&s).map(ProjectId))
+            .transpose()
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let task_id = self
+            .task_id
+            .map(|s| uuid::Uuid::parse_str(&s).map(TaskId))
+            .transpose()
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let payload: serde_json::Value = match self.payload {
+            Some(ref s) => serde_json::from_str(s)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            None => serde_json::Value::Null,
+        };
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&self.timestamp)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            .with_timezone(&Utc);
+
+        Ok(Event {
+            id: EventId(id),
+            event_type,
+            project_id,
+            task_id,
+            payload,
+            timestamp,
+        })
+    }
+}
+
+struct PendingActionRow {
+    id: String,
+    action_type: String,
+    project_id: String,
+    task_id: Option<String>,
+    description: String,
+    payload: Option<String>,
+    status: String,
+    created_at: String,
+}
+
+impl PendingActionRow {
+    fn into_pending_action(self) -> Result<PendingAction, StorageError> {
+        let id = uuid::Uuid::parse_str(&self.id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let action_type: PendingActionType = serde_json::from_str(&self.action_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let project_id = uuid::Uuid::parse_str(&self.project_id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let task_id = self
+            .task_id
+            .map(|s| uuid::Uuid::parse_str(&s).map(TaskId))
+            .transpose()
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let status: ActionStatus = serde_json::from_str(&self.status)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let payload: serde_json::Value = match self.payload {
+            Some(ref s) => serde_json::from_str(s)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            None => serde_json::Value::Null,
+        };
+        let created_at = chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            .with_timezone(&Utc);
+
+        Ok(PendingAction {
+            id: ActionId(id),
+            action_type,
+            project_id: ProjectId(project_id),
+            task_id,
+            description: self.description,
+            payload,
+            status,
+            created_at,
+        })
+    }
+}
+
 // rusqlite helper
 trait OptionalExt<T> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error>;
@@ -303,7 +986,10 @@ impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::event::EventType;
+    use crate::models::policy::{ActionStatus, PendingAction, PendingActionType};
     use crate::models::project::Project;
+    use crate::models::task::Task;
 
     #[test]
     fn create_in_memory_db() {
@@ -332,6 +1018,18 @@ mod tests {
     }
 
     #[test]
+    fn get_project_by_name() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("my-project", "/tmp/my");
+        storage.insert_project(&project).unwrap();
+
+        let fetched = storage.get_project_by_name("my-project").unwrap().unwrap();
+        assert_eq!(fetched.id, project.id);
+
+        assert!(storage.get_project_by_name("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
     fn delete_nonexistent_project_returns_not_found() {
         let storage = SqliteStorage::in_memory().unwrap();
         let result = storage.delete_project(&ProjectId::new());
@@ -339,52 +1037,118 @@ mod tests {
     }
 
     #[test]
+    fn task_crud_roundtrip() {
+        let storage = SqliteStorage::in_memory().unwrap();
+
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let task = Task::new(project.id.clone(), TaskType::Planning, "plan the module");
+        storage.insert_task(&task).unwrap();
+
+        let fetched = storage.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(fetched.description, "plan the module");
+        assert_eq!(fetched.task_type, TaskType::Planning);
+        assert_eq!(fetched.status, TaskStatus::Pending);
+
+        storage.update_task_status(&task.id, TaskStatus::Running).unwrap();
+        let fetched = storage.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(fetched.status, TaskStatus::Running);
+
+        let tasks = storage.list_tasks_by_project(&project.id).unwrap();
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
     fn usage_spend_queries() {
         let storage = SqliteStorage::in_memory().unwrap();
 
-        // Insert a project and a task first (for foreign keys)
         let project = Project::new("proj", "/tmp/p");
         storage.insert_project(&project).unwrap();
 
-        // Insert task (bypass full model, just need a row)
-        storage.conn.execute(
-            "INSERT INTO tasks (id, project_id, task_type, description, priority, status, created_at, updated_at)
-             VALUES ('task-1', ?1, 'Planning', 'test', 'Normal', 'Pending', '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z')",
-            params![project.id.0.to_string()],
-        ).unwrap();
+        let task = Task::new(project.id.clone(), TaskType::Planning, "test");
+        storage.insert_task(&task).unwrap();
 
-        // Insert usage records
-        storage.insert_usage_record(
-            "u1", "task-1", &project.id.0.to_string(), "claude",
-            100, 50, 500, Some("claude-sonnet"), "2026-03-15T10:00:00Z",
-        ).unwrap();
-        storage.insert_usage_record(
-            "u2", "task-1", &project.id.0.to_string(), "claude",
-            200, 100, 300, Some("claude-sonnet"), "2026-03-16T10:00:00Z",
-        ).unwrap();
-        storage.insert_usage_record(
-            "u3", "task-1", &project.id.0.to_string(), "ollama",
-            50, 25, 0, Some("llama3"), "2026-03-16T11:00:00Z",
-        ).unwrap();
+        let record = UsageRecord::new(
+            task.id.clone(),
+            project.id.clone(),
+            BackendId::new("claude"),
+            100,
+            50,
+            MoneyAmount::from_cents(500),
+        );
+        storage.insert_usage(&record).unwrap();
 
-        // Total March spend
-        let total = storage.total_spend_month("2026-03").unwrap();
-        assert_eq!(total.cents, 800);
+        let total = storage.total_spend_month(&Utc::now().format("%Y-%m").to_string()).unwrap();
+        assert_eq!(total.cents, 500);
+    }
 
-        // Claude spend
-        let claude_spend = storage.backend_spend_month(&BackendId::new("claude"), "2026-03").unwrap();
-        assert_eq!(claude_spend.cents, 800);
+    #[test]
+    fn event_insert_and_query() {
+        let storage = SqliteStorage::in_memory().unwrap();
 
-        // Ollama spend
-        let ollama_spend = storage.backend_spend_month(&BackendId::new("ollama"), "2026-03").unwrap();
-        assert_eq!(ollama_spend.cents, 0);
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
 
-        // Project spend
-        let proj_spend = storage.project_spend_month(&project.id, "2026-03").unwrap();
-        assert_eq!(proj_spend.cents, 800);
+        let event = Event::new(EventType::TaskSubmitted, serde_json::json!({"info": "test"}))
+            .with_project(project.id.clone());
+        storage.insert_event(&event).unwrap();
 
-        // Different month returns zero
-        let feb = storage.total_spend_month("2026-02").unwrap();
-        assert_eq!(feb.cents, 0);
+        let events = storage.list_events_recent(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::TaskSubmitted);
+
+        let proj_events = storage.list_events_by_project(&project.id, 10).unwrap();
+        assert_eq!(proj_events.len(), 1);
+    }
+
+    #[test]
+    fn pending_action_lifecycle() {
+        let storage = SqliteStorage::in_memory().unwrap();
+
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let action = PendingAction::new(
+            PendingActionType::ReviewRequest,
+            project.id.clone(),
+            "review changes",
+        );
+        storage.insert_pending_action(&action).unwrap();
+
+        let pending = storage.list_pending_actions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].description, "review changes");
+
+        storage
+            .update_action_status(&action.id, ActionStatus::Approved)
+            .unwrap();
+
+        // After approval, it should no longer appear in pending list
+        let pending = storage.list_pending_actions().unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn routing_history_insert() {
+        let storage = SqliteStorage::in_memory().unwrap();
+
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let task = Task::new(project.id.clone(), TaskType::Planning, "test");
+        storage.insert_task(&task).unwrap();
+
+        storage
+            .insert_routing_history(&task.id, "claude", "TaskTypeDefault", false, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn thread_safe_storage_works() {
+        let storage = ThreadSafeStorage::in_memory().unwrap();
+        let ym = ThreadSafeStorage::current_year_month();
+        let total = storage.total_spend_month(&ym).unwrap();
+        assert_eq!(total, MoneyAmount::ZERO);
     }
 }

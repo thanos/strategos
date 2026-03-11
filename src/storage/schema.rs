@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS tasks (
     id              TEXT PRIMARY KEY,
-    project_id      TEXT NOT NULL REFERENCES projects(id),
+    project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     task_type       TEXT NOT NULL,
     description     TEXT NOT NULL,
     priority        TEXT NOT NULL DEFAULT 'Normal',
@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE TABLE IF NOT EXISTS usage_records (
     id            TEXT PRIMARY KEY,
-    task_id       TEXT NOT NULL REFERENCES tasks(id),
-    project_id    TEXT NOT NULL REFERENCES projects(id),
+    task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     backend_id    TEXT NOT NULL,
     input_tokens  INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS pending_actions (
     id          TEXT PRIMARY KEY,
     action_type TEXT NOT NULL,
-    project_id  TEXT NOT NULL REFERENCES projects(id),
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     task_id     TEXT,
     description TEXT NOT NULL,
     payload     TEXT,
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 
 CREATE TABLE IF NOT EXISTS routing_history (
     id                        TEXT PRIMARY KEY,
-    task_id                   TEXT NOT NULL REFERENCES tasks(id),
+    task_id                   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     selected_backend          TEXT NOT NULL,
     reason                    TEXT NOT NULL,
     fallback_applied          INTEGER NOT NULL DEFAULT 0,

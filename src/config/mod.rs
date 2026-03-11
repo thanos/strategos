@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,64 @@ pub struct ProjectConfig {
 }
 
 impl GlobalConfig {
+    /// Returns the default config file path for the current platform.
+    pub fn default_path() -> PathBuf {
+        if let Some(config_dir) = dirs_config() {
+            config_dir.join("strategos").join("config.toml")
+        } else {
+            PathBuf::from("strategos.toml")
+        }
+    }
+
+    /// Returns the default storage (database) path.
+    pub fn default_storage_path() -> PathBuf {
+        if let Some(data_dir) = dirs_data() {
+            data_dir.join("strategos").join("strategos.db")
+        } else {
+            PathBuf::from("strategos.db")
+        }
+    }
+
+    /// Load config from a TOML file.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Load from default path, or return the sample config if file doesn't exist.
+    pub fn load_or_default() -> Self {
+        let path = Self::default_path();
+        if path.exists() {
+            match Self::load(&path) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("warning: failed to load config from {}: {}", path.display(), e);
+                    Self::sample()
+                }
+            }
+        } else {
+            Self::sample()
+        }
+    }
+
+    /// Write this config to a TOML file.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Returns the storage path, using the configured value or default.
+    pub fn storage_path(&self) -> PathBuf {
+        self.storage_path
+            .clone()
+            .unwrap_or_else(Self::default_storage_path)
+    }
+
     pub fn sample() -> Self {
         Self {
             default_backend: BackendId::new("claude"),
@@ -90,6 +148,49 @@ impl GlobalConfig {
     }
 }
 
+// Platform-specific directory helpers (minimal, no extra crate dependency)
+fn dirs_config() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config"))
+    } else if cfg!(target_os = "linux") {
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
+    } else {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config"))
+    }
+}
+
+fn dirs_data() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".local").join("share"))
+    } else if cfg!(target_os = "linux") {
+        std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
+    } else {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".local").join("share"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +210,27 @@ mod tests {
         let parsed: GlobalConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.default_backend.as_str(), "claude");
         assert_eq!(parsed.monthly_budget_dollars, 100.0);
+    }
+
+    #[test]
+    fn save_and_load_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let config = GlobalConfig::sample();
+        config.save(&path).unwrap();
+
+        let loaded = GlobalConfig::load(&path).unwrap();
+        assert_eq!(loaded.default_backend.as_str(), "claude");
+        assert_eq!(loaded.budget_mode, BudgetMode::Govern);
+    }
+
+    #[test]
+    fn default_paths_are_not_empty() {
+        let config_path = GlobalConfig::default_path();
+        assert!(config_path.to_string_lossy().contains("strategos"));
+
+        let storage_path = GlobalConfig::default_storage_path();
+        assert!(storage_path.to_string_lossy().contains("strategos"));
     }
 }
