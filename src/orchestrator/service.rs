@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::adapters::traits::{AdapterRegistry, ExecutionRequest, ExecutionStatus};
+use crate::adapters::traits::{AdapterRegistry, ExecutionContext, ExecutionRequest, ExecutionStatus};
 use crate::budget::governor::BudgetGovernor;
 use crate::errors::{AdapterError, RoutingError, StorageError};
 #[allow(unused_imports)]
@@ -105,9 +105,21 @@ impl Orchestrator {
 
     pub async fn submit_task(
         &self,
+        task: Task,
+        project_config: ProjectRoutingConfig,
+        estimated_cost: MoneyAmount,
+    ) -> Result<SubmitResult, SubmitError> {
+        self.submit_task_with_context(task, project_config, estimated_cost, None, Vec::new()).await
+    }
+
+    /// Submit a task with explicit execution context (project path, files).
+    pub async fn submit_task_with_context(
+        &self,
         mut task: Task,
         project_config: ProjectRoutingConfig,
         estimated_cost: MoneyAmount,
+        project_path: Option<std::path::PathBuf>,
+        context_files: Vec<std::path::PathBuf>,
     ) -> Result<SubmitResult, SubmitError> {
         // 1. Persist the task
         self.storage
@@ -302,10 +314,10 @@ impl Orchestrator {
             task_id: task.id.clone(),
             task_type: task.task_type,
             prompt: task.description.clone(),
-            context: crate::adapters::traits::ExecutionContext {
-                project_path: std::path::PathBuf::from("."),
+            context: ExecutionContext {
+                project_path: project_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
                 working_directory: None,
-                files: Vec::new(),
+                files: context_files,
                 session_id: None,
                 metadata: std::collections::HashMap::new(),
             },

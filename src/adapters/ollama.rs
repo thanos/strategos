@@ -11,7 +11,7 @@ use crate::models::{BackendId, MoneyAmount};
 
 use super::traits::{
     AdapterCapabilities, ExecutionAdapter, ExecutionHandle, ExecutionRequest, ExecutionResult,
-    ExecutionStatus, UsageReport,
+    ExecutionStatus, HealthStatus, UsageReport,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +115,24 @@ impl ExecutionAdapter for OllamaAdapter {
 
     fn capabilities(&self) -> &AdapterCapabilities {
         &self.capabilities
+    }
+
+    async fn health_check(&self) -> HealthStatus {
+        let url = format!("{}/api/tags", self.config.endpoint);
+        match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => HealthStatus::Healthy,
+            Ok(resp) => HealthStatus::Degraded(format!("API returned {}", resp.status())),
+            Err(e) if e.is_connect() => {
+                HealthStatus::Unavailable(format!(
+                    "cannot connect to Ollama at {}",
+                    self.config.endpoint
+                ))
+            }
+            Err(e) if e.is_timeout() => {
+                HealthStatus::Degraded("timeout during health check".into())
+            }
+            Err(e) => HealthStatus::Unavailable(e.to_string()),
+        }
     }
 
     #[instrument(skip(self, request), fields(backend = "ollama", model = %self.config.model))]

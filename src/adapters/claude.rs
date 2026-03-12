@@ -11,7 +11,7 @@ use crate::models::{BackendId, MoneyAmount};
 
 use super::traits::{
     AdapterCapabilities, ExecutionAdapter, ExecutionHandle, ExecutionRequest, ExecutionResult,
-    ExecutionStatus, UsageReport,
+    ExecutionStatus, HealthStatus, UsageReport,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ struct AnthropicErrorDetail {
 
 /// Estimate cost in cents based on model and token counts.
 /// Pricing as of mid-2025 (approximate).
-fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> MoneyAmount {
+pub fn estimate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> MoneyAmount {
     let (input_price_per_mtok, output_price_per_mtok) = match model {
         m if m.contains("opus") => (15.0, 75.0),
         m if m.contains("sonnet") => (3.0, 15.0),
@@ -166,6 +166,55 @@ impl ExecutionAdapter for ClaudeAdapter {
 
     fn capabilities(&self) -> &AdapterCapabilities {
         &self.capabilities
+    }
+
+    async fn health_check(&self) -> HealthStatus {
+        match self.api_key() {
+            Err(_) => {
+                return HealthStatus::Unavailable(format!(
+                    "API key not set (env: {})",
+                    self.config.api_key_env
+                ));
+            }
+            Ok(key) => {
+                // Lightweight check: send a minimal request to verify auth
+                let url = format!("{}/v1/messages", self.config.endpoint);
+                match self
+                    .client
+                    .post(&url)
+                    .header("x-api-key", &key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            HealthStatus::Healthy
+                        } else if status == reqwest::StatusCode::UNAUTHORIZED
+                            || status == reqwest::StatusCode::FORBIDDEN
+                        {
+                            HealthStatus::Unavailable(format!("authentication failed ({})", status))
+                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            HealthStatus::Degraded("rate limited".into())
+                        } else {
+                            HealthStatus::Degraded(format!("API returned {}", status))
+                        }
+                    }
+                    Err(e) => {
+                        if e.is_connect() {
+                            HealthStatus::Unavailable(format!("cannot connect: {}", e))
+                        } else if e.is_timeout() {
+                            HealthStatus::Degraded("timeout during health check".into())
+                        } else {
+                            HealthStatus::Unavailable(e.to_string())
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[instrument(skip(self, request), fields(backend = "claude", model = %self.config.model))]

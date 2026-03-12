@@ -9,7 +9,7 @@ use crate::models::{BackendId, MoneyAmount};
 
 use super::traits::{
     AdapterCapabilities, ExecutionAdapter, ExecutionHandle, ExecutionRequest, ExecutionResult,
-    ExecutionStatus, UsageReport,
+    ExecutionStatus, HealthStatus, UsageReport,
 };
 
 /// Configurable test double for the ExecutionAdapter trait.
@@ -127,6 +127,15 @@ impl ExecutionAdapter for FakeAdapter {
 
     fn capabilities(&self) -> &AdapterCapabilities {
         &self.capabilities
+    }
+
+    async fn health_check(&self) -> HealthStatus {
+        match &self.behavior {
+            FakeBehavior::FailWith(AdapterError::Unavailable(msg)) => {
+                HealthStatus::Unavailable(msg.clone())
+            }
+            _ => HealthStatus::Healthy,
+        }
     }
 
     async fn submit(&self, _request: ExecutionRequest) -> Result<ExecutionHandle, AdapterError> {
@@ -275,5 +284,19 @@ mod tests {
         let adapter = FakeAdapter::local("local-test");
         assert!(adapter.capabilities().local_execution);
         assert!(!adapter.capabilities().code_editing);
+    }
+
+    #[tokio::test]
+    async fn fake_health_check_healthy() {
+        let adapter = FakeAdapter::succeeding("test");
+        let status = adapter.health_check().await;
+        assert!(matches!(status, HealthStatus::Healthy));
+    }
+
+    #[tokio::test]
+    async fn fake_health_check_unavailable() {
+        let adapter = FakeAdapter::failing("test", AdapterError::Unavailable("server down".into()));
+        let status = adapter.health_check().await;
+        assert!(matches!(status, HealthStatus::Unavailable(_)));
     }
 }

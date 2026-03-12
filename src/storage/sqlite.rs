@@ -16,7 +16,7 @@ use crate::models::{
     ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
 };
 
-use super::schema::SCHEMA_V1;
+use super::schema::{SCHEMA_V1, SCHEMA_V2};
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -79,6 +79,18 @@ impl SqliteStorage {
                 .execute(
                     "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
                     params![1, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 2 {
+            self.conn
+                .execute_batch(SCHEMA_V2)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![2, Utc::now().to_rfc3339()],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
         }
@@ -424,6 +436,66 @@ impl SqliteStorage {
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(MoneyAmount::from_cents(cents))
+    }
+
+    /// List usage records with optional filters.
+    pub fn list_usage_records(
+        &self,
+        project_id: Option<&ProjectId>,
+        backend_id: Option<&BackendId>,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<UsageRecord>, StorageError> {
+        let mut sql = String::from(
+            "SELECT id, task_id, project_id, backend_id, input_tokens, output_tokens, cost_cents, model, recorded_at
+             FROM usage_records WHERE 1=1"
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(pid) = project_id {
+            params_vec.push(Box::new(pid.0.to_string()));
+            sql.push_str(&format!(" AND project_id = ?{}", params_vec.len()));
+        }
+        if let Some(bid) = backend_id {
+            params_vec.push(Box::new(bid.as_str().to_string()));
+            sql.push_str(&format!(" AND backend_id = ?{}", params_vec.len()));
+        }
+        if let Some(since_date) = since {
+            params_vec.push(Box::new(since_date.to_string()));
+            sql.push_str(&format!(" AND recorded_at >= ?{}", params_vec.len()));
+        }
+        params_vec.push(Box::new(limit as i64));
+        sql.push_str(&format!(" ORDER BY recorded_at DESC LIMIT ?{}", params_vec.len()));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(UsageRecordRow {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    backend_id: row.get(3)?,
+                    input_tokens: row.get(4)?,
+                    output_tokens: row.get(5)?,
+                    cost_cents: row.get(6)?,
+                    model: row.get(7)?,
+                    recorded_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let r = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            records.push(r.into_usage_record()?);
+        }
+        Ok(records)
     }
 
     // -----------------------------------------------------------------------
@@ -967,6 +1039,44 @@ pub struct RoutingHistoryRow {
     pub decided_at: String,
 }
 
+struct UsageRecordRow {
+    id: String,
+    task_id: String,
+    project_id: String,
+    backend_id: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_cents: i64,
+    model: Option<String>,
+    recorded_at: String,
+}
+
+impl UsageRecordRow {
+    fn into_usage_record(self) -> Result<UsageRecord, StorageError> {
+        let id = uuid::Uuid::parse_str(&self.id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let task_id = uuid::Uuid::parse_str(&self.task_id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let project_id = uuid::Uuid::parse_str(&self.project_id)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let recorded_at = chrono::DateTime::parse_from_rfc3339(&self.recorded_at)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            .with_timezone(&Utc);
+
+        Ok(UsageRecord {
+            id: crate::models::UsageId(id),
+            task_id: TaskId(task_id),
+            project_id: ProjectId(project_id),
+            backend_id: BackendId::new(&self.backend_id),
+            input_tokens: self.input_tokens as u64,
+            output_tokens: self.output_tokens as u64,
+            cost: MoneyAmount::from_cents(self.cost_cents),
+            model: self.model,
+            recorded_at,
+        })
+    }
+}
+
 struct ProjectRow {
     id: String,
     name: String,
@@ -1428,6 +1538,96 @@ mod tests {
         let task_actions = storage.list_actions_for_task(&task.id).unwrap();
         assert_eq!(task_actions.len(), 1);
         assert_eq!(task_actions[0].description, "review findings");
+    }
+
+    #[test]
+    fn list_usage_records_no_filter() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let task = Task::new(project.id.clone(), TaskType::Planning, "test");
+        storage.insert_task(&task).unwrap();
+
+        let record = UsageRecord::new(
+            task.id.clone(),
+            project.id.clone(),
+            BackendId::new("claude"),
+            100,
+            50,
+            MoneyAmount::from_cents(200),
+        );
+        storage.insert_usage(&record).unwrap();
+
+        let records = storage.list_usage_records(None, None, None, 50).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost.cents, 200);
+        assert_eq!(records[0].backend_id, BackendId::new("claude"));
+    }
+
+    #[test]
+    fn list_usage_records_with_project_filter() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let p1 = Project::new("p1", "/tmp/p1");
+        let p2 = Project::new("p2", "/tmp/p2");
+        storage.insert_project(&p1).unwrap();
+        storage.insert_project(&p2).unwrap();
+
+        let t1 = Task::new(p1.id.clone(), TaskType::Planning, "t1");
+        let t2 = Task::new(p2.id.clone(), TaskType::Review, "t2");
+        storage.insert_task(&t1).unwrap();
+        storage.insert_task(&t2).unwrap();
+
+        let r1 = UsageRecord::new(t1.id.clone(), p1.id.clone(), BackendId::new("claude"), 100, 50, MoneyAmount::from_cents(100));
+        let r2 = UsageRecord::new(t2.id.clone(), p2.id.clone(), BackendId::new("ollama"), 200, 100, MoneyAmount::ZERO);
+        storage.insert_usage(&r1).unwrap();
+        storage.insert_usage(&r2).unwrap();
+
+        let filtered = storage.list_usage_records(Some(&p1.id), None, None, 50).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].project_id, p1.id);
+    }
+
+    #[test]
+    fn list_usage_records_with_backend_filter() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let t1 = Task::new(project.id.clone(), TaskType::Planning, "t1");
+        let t2 = Task::new(project.id.clone(), TaskType::Summarization, "t2");
+        storage.insert_task(&t1).unwrap();
+        storage.insert_task(&t2).unwrap();
+
+        let r1 = UsageRecord::new(t1.id.clone(), project.id.clone(), BackendId::new("claude"), 100, 50, MoneyAmount::from_cents(100));
+        let r2 = UsageRecord::new(t2.id.clone(), project.id.clone(), BackendId::new("ollama"), 200, 100, MoneyAmount::ZERO);
+        storage.insert_usage(&r1).unwrap();
+        storage.insert_usage(&r2).unwrap();
+
+        let claude_only = storage.list_usage_records(None, Some(&BackendId::new("claude")), None, 50).unwrap();
+        assert_eq!(claude_only.len(), 1);
+        assert_eq!(claude_only[0].backend_id, BackendId::new("claude"));
+    }
+
+    #[test]
+    fn schema_v2_migration_creates_indexes() {
+        let storage = SqliteStorage::in_memory().unwrap();
+
+        // Verify migration version is 2
+        let version: i64 = storage.conn.query_row(
+            "SELECT MAX(version) FROM _migrations",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(version, 2);
+
+        // Verify indexes exist
+        let index_count: i64 = storage.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(index_count >= 7, "expected at least 7 indexes, got {}", index_count);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 
 use crate::adapters::claude::{ClaudeAdapter, ClaudeConfig};
+use crate::adapters::traits::estimate_task_cost;
 use crate::adapters::ollama::{OllamaAdapter, OllamaConfig};
 use crate::adapters::opencode::{OpenCodeAdapter, OpenCodeConfig};
 use crate::adapters::traits::AdapterRegistry;
@@ -103,6 +104,25 @@ pub enum Commands {
         /// Override backend selection
         #[arg(long)]
         backend: Option<String>,
+    },
+
+    /// Check backend health status
+    Health,
+
+    /// Show usage history
+    Usage {
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by backend
+        #[arg(long)]
+        backend: Option<String>,
+        /// Show records from the last N days
+        #[arg(long, default_value = "30")]
+        days: u32,
+        /// Maximum number of records
+        #[arg(long, default_value = "50")]
+        limit: usize,
     },
 
     /// Show current configuration
@@ -252,6 +272,13 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             files,
             backend,
         } => cmd_review(&config, &project, &files, backend).await,
+        Commands::Health => cmd_health(&config).await,
+        Commands::Usage {
+            project,
+            backend,
+            days,
+            limit,
+        } => cmd_usage(&config, project.as_deref(), backend.as_deref(), days, limit),
         Commands::Config => cmd_config(&config, &cli.config_path),
     }
 }
@@ -335,8 +362,20 @@ async fn cmd_submit(
 
     println!("Submitting {:?} task to project '{}'...", task_type, project_name);
 
+    let estimated_cost = estimate_task_cost(
+        description,
+        &config.default_backend,
+        config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+    );
+
     let result = orchestrator
-        .submit_task(task, project_config, MoneyAmount::from_cents(100))
+        .submit_task_with_context(
+            task,
+            project_config,
+            estimated_cost,
+            Some(project.path.clone()),
+            Vec::new(),
+        )
         .await?;
 
     println!(
@@ -711,8 +750,20 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                 &id
             );
 
+            let estimated_cost = estimate_task_cost(
+                &original.description,
+                &config.default_backend,
+                config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+            );
+
             let result = orchestrator
-                .submit_task(new_task, project_config, MoneyAmount::from_cents(100))
+                .submit_task_with_context(
+                    new_task,
+                    project_config,
+                    estimated_cost,
+                    Some(project.path.clone()),
+                    Vec::new(),
+                )
                 .await?;
 
             println!("New task: {}", result.task.id.0);
@@ -858,8 +909,20 @@ async fn cmd_prepare_commit(
 
     println!("Preparing commit message for '{}'...", project_name);
 
+    let estimated_cost = estimate_task_cost(
+        &prompt,
+        &config.default_backend,
+        config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+    );
+
     let result = orchestrator
-        .submit_task(task, project_config, MoneyAmount::from_cents(50))
+        .submit_task_with_context(
+            task,
+            project_config,
+            estimated_cost,
+            Some(project.path.clone()),
+            Vec::new(),
+        )
         .await?;
 
     // Queue result as a pending action
@@ -921,10 +984,27 @@ async fn cmd_review(
 
     let project_config = build_project_routing_config(config, &project);
 
+    let context_files: Vec<std::path::PathBuf> = files
+        .iter()
+        .map(|f| project.path.join(f))
+        .collect();
+
+    let estimated_cost = estimate_task_cost(
+        &prompt,
+        &config.default_backend,
+        config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+    );
+
     println!("Submitting review for '{}'...", project_name);
 
     let result = orchestrator
-        .submit_task(task, project_config, MoneyAmount::from_cents(100))
+        .submit_task_with_context(
+            task,
+            project_config,
+            estimated_cost,
+            Some(project.path.clone()),
+            context_files,
+        )
         .await?;
 
     let review_output = result.execution_output.unwrap_or_default();
@@ -949,6 +1029,103 @@ async fn cmd_review(
         println!("\n--- Review ---");
         println!("{}", review_output);
     }
+
+    Ok(())
+}
+
+async fn cmd_health(config: &GlobalConfig) -> Result<()> {
+    let storage = Arc::new(open_storage(config)?);
+    let (registry, _governor) = build_runtime(config, &storage)?;
+
+    println!("Backend Health Check");
+    println!("{}", "=".repeat(50));
+    println!("{:<15} {:<35}", "BACKEND", "STATUS");
+    println!("{}", "-".repeat(50));
+
+    for backend_id in registry.list() {
+        if let Some(adapter) = registry.get(backend_id) {
+            let status = adapter.health_check().await;
+            println!("{:<15} {}", backend_id, status);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_usage(
+    config: &GlobalConfig,
+    project_name: Option<&str>,
+    backend_name: Option<&str>,
+    days: u32,
+    limit: usize,
+) -> Result<()> {
+    let storage = open_storage(config)?;
+
+    let project_id = if let Some(name) = project_name {
+        let project = storage
+            .get_project_by_name(name)?
+            .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?;
+        Some(project.id)
+    } else {
+        None
+    };
+
+    let backend_id = backend_name.map(BackendId::new);
+
+    let since = {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        cutoff.to_rfc3339()
+    };
+
+    let records = storage.list_usage_records(
+        project_id.as_ref(),
+        backend_id.as_ref(),
+        Some(&since),
+        limit,
+    )?;
+
+    if records.is_empty() {
+        println!("No usage records found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<10} {:<10} {:<10} {:<10} {}",
+        "TIMESTAMP", "BACKEND", "INPUT", "OUTPUT", "COST", "TASK"
+    );
+    println!("{}", "-".repeat(75));
+
+    let mut total_cost = MoneyAmount::ZERO;
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+
+    for record in &records {
+        total_cost = total_cost + record.cost;
+        total_input += record.input_tokens;
+        total_output += record.output_tokens;
+
+        let ts = record.recorded_at.format("%Y-%m-%d %H:%M");
+        let task_short = &record.task_id.0.to_string()[..8];
+        println!(
+            "{:<20} {:<10} {:<10} {:<10} {:<10} {}",
+            ts,
+            record.backend_id,
+            record.input_tokens,
+            record.output_tokens,
+            record.cost,
+            task_short
+        );
+    }
+
+    println!("{}", "-".repeat(75));
+    println!(
+        "{:<20} {:<10} {:<10} {:<10} {}",
+        format!("{} record(s)", records.len()),
+        "",
+        total_input,
+        total_output,
+        total_cost
+    );
 
     Ok(())
 }

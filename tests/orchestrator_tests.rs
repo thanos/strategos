@@ -391,3 +391,41 @@ async fn orchestrator_budget_approval_creates_pending_action() {
     use strategos::models::event::EventType;
     assert!(events.iter().any(|e| e.event_type == EventType::ActionCreated));
 }
+
+// -----------------------------------------------------------------------
+// Phase 6: Execution context and cost estimation tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_submit_with_context() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+    let project_path = std::path::PathBuf::from("/tmp/test");
+    let files = vec![std::path::PathBuf::from("/tmp/test/src/main.rs")];
+
+    let result = orchestrator
+        .submit_task_with_context(
+            task,
+            ProjectRoutingConfig::default(),
+            MoneyAmount::from_cents(50),
+            Some(project_path),
+            files,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.routing_decision.selected_backend, BackendId::new("ollama"));
+}
+
+#[tokio::test]
+async fn orchestrator_cost_estimation_zero_for_local() {
+    use strategos::adapters::traits::estimate_task_cost;
+
+    let cost = estimate_task_cost(
+        "summarize this module please",
+        &BackendId::new("ollama"),
+        "llama3",
+    );
+    assert_eq!(cost, MoneyAmount::ZERO);
+}

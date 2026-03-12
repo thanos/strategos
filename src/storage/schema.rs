@@ -70,3 +70,14 @@ CREATE TABLE IF NOT EXISTS routing_history (
     decided_at                TEXT NOT NULL
 );
 "#;
+
+/// V2: Add performance indexes for common query patterns.
+pub const SCHEMA_V2: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_usage_records_recorded_at ON usage_records(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_usage_records_project_id ON usage_records(project_id);
+CREATE INDEX IF NOT EXISTS idx_usage_records_backend_id ON usage_records(backend_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_status ON pending_actions(status);
+CREATE INDEX IF NOT EXISTS idx_routing_history_task_id ON routing_history(task_id);
+"#;

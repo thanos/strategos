@@ -6,7 +6,7 @@ use crate::models::BackendId;
 
 use super::traits::{
     AdapterCapabilities, ExecutionAdapter, ExecutionHandle, ExecutionRequest, ExecutionStatus,
-    UsageReport,
+    HealthStatus, UsageReport,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +61,23 @@ impl ExecutionAdapter for OpenCodeAdapter {
 
     fn capabilities(&self) -> &AdapterCapabilities {
         &self.capabilities
+    }
+
+    async fn health_check(&self) -> HealthStatus {
+        match &self.config.binary_path {
+            Some(path) => {
+                if std::path::Path::new(path).exists() {
+                    HealthStatus::Healthy
+                } else {
+                    HealthStatus::Unavailable(format!("binary not found at {}", path))
+                }
+            }
+            None => {
+                HealthStatus::Unavailable(
+                    "opencode adapter is a stub — not yet implemented".into(),
+                )
+            }
+        }
     }
 
     async fn submit(&self, _request: ExecutionRequest) -> Result<ExecutionHandle, AdapterError> {

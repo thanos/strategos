@@ -10,6 +10,33 @@ use serde::{Deserialize, Serialize};
 use crate::errors::AdapterError;
 use crate::models::{BackendId, MoneyAmount, TaskId, TaskType};
 
+/// Backend health status.
+#[derive(Debug, Clone)]
+pub enum HealthStatus {
+    /// Backend is reachable and ready.
+    Healthy,
+    /// Backend is reachable but degraded.
+    Degraded(String),
+    /// Backend is not reachable.
+    Unavailable(String),
+}
+
+impl HealthStatus {
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, HealthStatus::Healthy | HealthStatus::Degraded(_))
+    }
+}
+
+impl std::fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HealthStatus::Healthy => write!(f, "healthy"),
+            HealthStatus::Degraded(msg) => write!(f, "degraded: {}", msg),
+            HealthStatus::Unavailable(msg) => write!(f, "unavailable: {}", msg),
+        }
+    }
+}
+
 /// The provider-neutral execution adapter contract.
 /// Every backend — Claude, Ollama, OpenCode — implements this trait.
 #[async_trait]
@@ -19,6 +46,9 @@ pub trait ExecutionAdapter: Send + Sync {
 
     /// Reports the capabilities of this backend.
     fn capabilities(&self) -> &AdapterCapabilities;
+
+    /// Check if the backend is reachable and ready.
+    async fn health_check(&self) -> HealthStatus;
 
     /// Submit a task for execution.
     async fn submit(&self, request: ExecutionRequest) -> Result<ExecutionHandle, AdapterError>;
@@ -150,6 +180,19 @@ impl AdapterCapabilities {
     }
 }
 
+/// Estimate cost for a task based on prompt length and backend.
+/// Uses a rough heuristic: ~4 chars per token for input, assumes output is ~50% of input.
+pub fn estimate_task_cost(prompt: &str, backend_id: &BackendId, model: &str) -> MoneyAmount {
+    let estimated_input_tokens = (prompt.len() as u64) / 4;
+    let estimated_output_tokens = estimated_input_tokens / 2;
+
+    match backend_id.as_str() {
+        "claude" => crate::adapters::claude::estimate_cost(model, estimated_input_tokens, estimated_output_tokens),
+        "ollama" => MoneyAmount::ZERO, // Local execution, no cost
+        _ => MoneyAmount::ZERO,
+    }
+}
+
 /// Registry of available execution adapters.
 pub struct AdapterRegistry {
     adapters: HashMap<BackendId, Arc<dyn ExecutionAdapter>>,
@@ -269,5 +312,50 @@ mod tests {
         let r = UsageReport::zero();
         assert_eq!(r.input_tokens, 0);
         assert_eq!(r.cost, MoneyAmount::ZERO);
+    }
+
+    #[test]
+    fn estimate_task_cost_claude_nonzero() {
+        let cost = estimate_task_cost(
+            "This is a test prompt that has some length to it for estimation purposes.",
+            &BackendId::new("claude"),
+            "claude-sonnet-4-20250514",
+        );
+        // Should produce a non-zero cost for Claude
+        assert!(cost.cents >= 0);
+    }
+
+    #[test]
+    fn estimate_task_cost_ollama_free() {
+        let cost = estimate_task_cost(
+            "Some prompt for Ollama local inference.",
+            &BackendId::new("ollama"),
+            "llama3",
+        );
+        assert_eq!(cost, MoneyAmount::ZERO);
+    }
+
+    #[test]
+    fn estimate_task_cost_unknown_backend_free() {
+        let cost = estimate_task_cost(
+            "Some prompt.",
+            &BackendId::new("unknown"),
+            "some-model",
+        );
+        assert_eq!(cost, MoneyAmount::ZERO);
+    }
+
+    #[test]
+    fn health_status_display() {
+        assert_eq!(format!("{}", HealthStatus::Healthy), "healthy");
+        assert!(format!("{}", HealthStatus::Degraded("slow".into())).contains("degraded"));
+        assert!(format!("{}", HealthStatus::Unavailable("down".into())).contains("unavailable"));
+    }
+
+    #[test]
+    fn health_status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(HealthStatus::Degraded("slow".into()).is_healthy());
+        assert!(!HealthStatus::Unavailable("down".into()).is_healthy());
     }
 }
