@@ -12,7 +12,7 @@ use strategos::models::task::{Task, TaskStatus};
 use strategos::orchestrator::service::{CancelError, Orchestrator, RetryPolicy};
 use strategos::routing::engine::*;
 use strategos::routing::policy::RoutingPolicy;
-use strategos::storage::sqlite::SqliteStorage;
+use strategos::storage::sqlite::{SqliteStorage, ProjectExportData};
 
 fn setup_orchestrator(
     budget_mode: BudgetMode,
@@ -951,4 +951,324 @@ fn storage_update_project() {
     let fetched = storage.get_project_by_name("test-proj").unwrap().unwrap();
     assert_eq!(fetched.path, std::path::PathBuf::from("/new/path"));
     assert_eq!(fetched.privacy, PrivacyLevel::LocalOnly);
+}
+
+// -----------------------------------------------------------------------
+// Phase 9: Task Dependencies
+// -----------------------------------------------------------------------
+
+#[test]
+fn task_dependency_storage_roundtrip() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("dep-project", "/tmp/dep");
+    storage.insert_project(&project).unwrap();
+
+    let task_a = Task::new(project.id.clone(), TaskType::Planning, "task A");
+    let task_b = Task::new(project.id.clone(), TaskType::Review, "task B depends on A");
+
+    storage.insert_task(&task_a).unwrap();
+    storage.insert_task(&task_b).unwrap();
+
+    storage.insert_task_dependency(&task_b.id, &task_a.id).unwrap();
+
+    let deps = storage.get_task_dependencies(&task_b.id).unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0], task_a.id);
+}
+
+#[test]
+fn all_dependencies_completed_when_dep_done() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("dep-project", "/tmp/dep");
+    storage.insert_project(&project).unwrap();
+
+    let task_a = Task::new(project.id.clone(), TaskType::Planning, "task A");
+    let task_b = Task::new(project.id.clone(), TaskType::Review, "task B");
+
+    storage.insert_task(&task_a).unwrap();
+    storage.insert_task(&task_b).unwrap();
+
+    storage.insert_task_dependency(&task_b.id, &task_a.id).unwrap();
+
+    // task_a is Pending, so deps are not satisfied
+    assert!(!storage.all_dependencies_completed(&task_b.id).unwrap());
+
+    // Complete task_a
+    storage.update_task_status(&task_a.id, TaskStatus::Completed).unwrap();
+    assert!(storage.all_dependencies_completed(&task_b.id).unwrap());
+}
+
+#[test]
+fn submit_with_satisfied_deps_succeeds() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    // Create and complete a dependency task
+    let dep_task = Task::new(project.id.clone(), TaskType::Planning, "dependency");
+    orchestrator.storage.insert_task(&dep_task).unwrap();
+    orchestrator.storage.update_task_status(&dep_task.id, TaskStatus::Completed).unwrap();
+
+    // Create a new task that depends on the completed one
+    let task = Task::new(project.id.clone(), TaskType::Review, "depends on planning");
+    orchestrator.storage.insert_task(&task).unwrap();
+    orchestrator.add_task_dependencies(&task.id, &[dep_task.id.clone()]).unwrap();
+
+    // Dependencies satisfied
+    assert!(orchestrator.check_dependencies(&task.id).unwrap());
+}
+
+#[test]
+fn submit_with_unsatisfied_deps_fails_check() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    // Create a dependency task (still pending)
+    let dep_task = Task::new(project.id.clone(), TaskType::Planning, "dependency");
+    orchestrator.storage.insert_task(&dep_task).unwrap();
+
+    // Create a task that depends on the pending one
+    let task = Task::new(project.id.clone(), TaskType::Review, "depends on planning");
+    orchestrator.storage.insert_task(&task).unwrap();
+    orchestrator.add_task_dependencies(&task.id, &[dep_task.id.clone()]).unwrap();
+
+    // Dependencies NOT satisfied
+    assert!(!orchestrator.check_dependencies(&task.id).unwrap());
+}
+
+#[test]
+fn task_dependency_display_in_storage() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("dep-project", "/tmp/dep");
+    storage.insert_project(&project).unwrap();
+
+    let task_a = Task::new(project.id.clone(), TaskType::Planning, "A");
+    let task_b = Task::new(project.id.clone(), TaskType::Review, "B");
+    let task_c = Task::new(project.id.clone(), TaskType::Summarization, "C depends on A and B");
+
+    storage.insert_task(&task_a).unwrap();
+    storage.insert_task(&task_b).unwrap();
+    storage.insert_task(&task_c).unwrap();
+
+    storage.insert_task_dependency(&task_c.id, &task_a.id).unwrap();
+    storage.insert_task_dependency(&task_c.id, &task_b.id).unwrap();
+
+    let deps = storage.get_task_dependencies(&task_c.id).unwrap();
+    assert_eq!(deps.len(), 2);
+}
+
+// -----------------------------------------------------------------------
+// Phase 9: Dry-Run Routing
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn dry_run_produces_decision_without_creating_task() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "dry run test");
+    let project_config = ProjectRoutingConfig::default();
+
+    let routing_request = RoutingRequest {
+        task_id: task.id.clone(),
+        task_type: task.task_type,
+        project_id: task.project_id.clone(),
+        project_config,
+        backend_override: None,
+        estimated_cost: MoneyAmount::from_cents(50),
+    };
+
+    // Route without persisting
+    let decision = orchestrator.routing_engine.route(routing_request).await.unwrap();
+    assert!(!decision.selected_backend.as_str().is_empty());
+
+    // Task was NOT persisted
+    let stored = orchestrator.storage.get_task(&task.id).unwrap();
+    assert!(stored.is_none(), "dry-run should not create a task in storage");
+}
+
+// -----------------------------------------------------------------------
+// Phase 9: Event Filtering
+// -----------------------------------------------------------------------
+
+#[test]
+fn event_filter_by_type() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("evt-project", "/tmp/evt");
+    storage.insert_project(&project).unwrap();
+
+    use strategos::models::event::{Event, EventType};
+
+    let e1 = Event::new(EventType::TaskSubmitted, serde_json::json!({}))
+        .with_project(project.id.clone());
+    let e2 = Event::new(EventType::TaskCompleted, serde_json::json!({}))
+        .with_project(project.id.clone());
+    let e3 = Event::new(EventType::TaskSubmitted, serde_json::json!({}))
+        .with_project(project.id.clone());
+
+    storage.insert_event(&e1).unwrap();
+    storage.insert_event(&e2).unwrap();
+    storage.insert_event(&e3).unwrap();
+
+    let filtered = storage
+        .list_events_filtered(Some("TaskSubmitted"), None, None, None, None, 100)
+        .unwrap();
+    assert_eq!(filtered.len(), 2);
+    for e in &filtered {
+        assert_eq!(e.event_type, EventType::TaskSubmitted);
+    }
+}
+
+#[test]
+fn event_filter_by_project() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let p1 = Project::new("proj-a", "/tmp/a");
+    let p2 = Project::new("proj-b", "/tmp/b");
+    storage.insert_project(&p1).unwrap();
+    storage.insert_project(&p2).unwrap();
+
+    use strategos::models::event::{Event, EventType};
+
+    let e1 = Event::new(EventType::TaskSubmitted, serde_json::json!({}))
+        .with_project(p1.id.clone());
+    let e2 = Event::new(EventType::TaskSubmitted, serde_json::json!({}))
+        .with_project(p2.id.clone());
+    let e3 = Event::new(EventType::TaskCompleted, serde_json::json!({}))
+        .with_project(p1.id.clone());
+
+    storage.insert_event(&e1).unwrap();
+    storage.insert_event(&e2).unwrap();
+    storage.insert_event(&e3).unwrap();
+
+    let filtered = storage
+        .list_events_filtered(None, Some(&p1.id), None, None, None, 100)
+        .unwrap();
+    assert_eq!(filtered.len(), 2);
+}
+
+#[test]
+fn event_filter_by_date_range() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    use strategos::models::event::{Event, EventType};
+    use chrono::{Utc, Duration};
+
+    let now = Utc::now();
+    let e1 = Event::new(EventType::TaskSubmitted, serde_json::json!({}));
+    storage.insert_event(&e1).unwrap();
+
+    // Filter with a future since — should return nothing
+    let future = (now + Duration::hours(1)).to_rfc3339();
+    let filtered = storage
+        .list_events_filtered(None, None, None, Some(&future), None, 100)
+        .unwrap();
+    assert_eq!(filtered.len(), 0);
+
+    // Filter with a past since — should return the event
+    let past = (now - Duration::hours(1)).to_rfc3339();
+    let filtered = storage
+        .list_events_filtered(None, None, None, Some(&past), None, 100)
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// Phase 9: Project Export/Import
+// -----------------------------------------------------------------------
+
+#[test]
+fn export_roundtrip() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("export-proj", "/tmp/export");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Planning, "plan something");
+    storage.insert_task(&task).unwrap();
+    storage.update_task_status(&task.id, TaskStatus::Completed).unwrap();
+
+    // Add a usage record
+    storage
+        .insert_usage_record(
+            &uuid::Uuid::new_v4().to_string(),
+            &task.id.0.to_string(),
+            &project.id.0.to_string(),
+            "claude",
+            100,
+            50,
+            75,
+            Some("claude-sonnet"),
+            &Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+
+    let data = storage.export_project_data(&project.id).unwrap();
+    assert_eq!(data.project.name, "export-proj");
+    assert_eq!(data.tasks.len(), 1);
+    assert_eq!(data.usage_records.len(), 1);
+
+    // Serialize/deserialize roundtrip
+    let json = serde_json::to_string_pretty(&data).unwrap();
+    let parsed: ProjectExportData = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.project.name, "export-proj");
+    assert_eq!(parsed.tasks.len(), 1);
+}
+
+use chrono::Utc;
+
+#[test]
+fn import_skips_duplicates() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("import-proj", "/tmp/import");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Review, "review code");
+    storage.insert_task(&task).unwrap();
+
+    let data = storage.export_project_data(&project.id).unwrap();
+
+    // Import into same database — everything should be skipped
+    let result = storage.import_project_data(&data).unwrap();
+    assert!(result.skipped_project);
+    assert!(!result.imported_project);
+    assert_eq!(result.skipped_tasks, 1);
+    assert_eq!(result.imported_tasks, 0);
+}
+
+#[test]
+fn import_into_fresh_database() {
+    let storage1 = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("fresh-proj", "/tmp/fresh");
+    storage1.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Planning, "plan");
+    storage1.insert_task(&task).unwrap();
+
+    let data = storage1.export_project_data(&project.id).unwrap();
+
+    // Import into a completely different database
+    let storage2 = SqliteStorage::in_memory().unwrap();
+    let result = storage2.import_project_data(&data).unwrap();
+
+    assert!(result.imported_project);
+    assert!(!result.skipped_project);
+    assert_eq!(result.imported_tasks, 1);
+    assert_eq!(result.skipped_tasks, 0);
+
+    // Verify data exists in new database
+    let imported_project = storage2.get_project_by_name("fresh-proj").unwrap();
+    assert!(imported_project.is_some());
+    let imported_tasks = storage2.list_tasks_by_project(&project.id).unwrap();
+    assert_eq!(imported_tasks.len(), 1);
+}
+
+#[test]
+fn schema_v4_creates_task_dependencies_table() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    // Verify the task_dependencies table exists
+    let count: i64 = storage
+        .conn_ref()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_dependencies'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }

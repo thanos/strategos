@@ -98,3 +98,14 @@ CREATE TABLE IF NOT EXISTS task_outputs (
 );
 CREATE INDEX IF NOT EXISTS idx_task_outputs_task_id ON task_outputs(task_id);
 "#;
+
+/// V4: Add task_dependencies table for task dependency tracking.
+pub const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on_task_id);
+"#;

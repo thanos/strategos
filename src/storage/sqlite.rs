@@ -16,7 +16,7 @@ use crate::models::{
     ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
 };
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -47,6 +47,11 @@ impl SqliteStorage {
         let storage = Self { conn };
         storage.migrate()?;
         Ok(storage)
+    }
+
+    /// Expose connection reference for testing.
+    pub fn conn_ref(&self) -> &Connection {
+        &self.conn
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -103,6 +108,18 @@ impl SqliteStorage {
                 .execute(
                     "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
                     params![3, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 4 {
+            self.conn
+                .execute_batch(SCHEMA_V4)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![4, Utc::now().to_rfc3339()],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
         }
@@ -1081,6 +1098,305 @@ impl SqliteStorage {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(count as usize)
     }
+
+    // -----------------------------------------------------------------------
+    // Task dependencies
+    // -----------------------------------------------------------------------
+
+    /// Insert a dependency: `task_id` depends on `depends_on_task_id`.
+    pub fn insert_task_dependency(
+        &self,
+        task_id: &TaskId,
+        depends_on_task_id: &TaskId,
+    ) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?1, ?2)",
+                params![task_id.0.to_string(), depends_on_task_id.0.to_string()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get all task IDs that the given task depends on.
+    pub fn get_task_dependencies(&self, task_id: &TaskId) -> Result<Vec<TaskId>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![task_id.0.to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut deps = Vec::new();
+        for row in rows {
+            let id_str = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            let uuid = uuid::Uuid::parse_str(&id_str)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            deps.push(TaskId(uuid));
+        }
+        Ok(deps)
+    }
+
+    /// Check if all dependencies for a task are in Completed status.
+    pub fn all_dependencies_completed(&self, task_id: &TaskId) -> Result<bool, StorageError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dependencies td
+                 JOIN tasks t ON t.id = td.depends_on_task_id
+                 WHERE td.task_id = ?1 AND t.status != '\"Completed\"'",
+                params![task_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count == 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Event filtering
+    // -----------------------------------------------------------------------
+
+    /// List events with optional filters.
+    pub fn list_events_filtered(
+        &self,
+        event_type: Option<&str>,
+        project_id: Option<&ProjectId>,
+        task_id: Option<&TaskId>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Event>, StorageError> {
+        let mut sql = String::from(
+            "SELECT id, event_type, project_id, task_id, payload, timestamp
+             FROM events WHERE 1=1"
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(et) = event_type {
+            // Event types are stored as JSON strings like "\"TaskSubmitted\""
+            let et_json = serde_json::to_string(et)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            params_vec.push(Box::new(et_json));
+            sql.push_str(&format!(" AND event_type = ?{}", params_vec.len()));
+        }
+        if let Some(pid) = project_id {
+            params_vec.push(Box::new(pid.0.to_string()));
+            sql.push_str(&format!(" AND project_id = ?{}", params_vec.len()));
+        }
+        if let Some(tid) = task_id {
+            params_vec.push(Box::new(tid.0.to_string()));
+            sql.push_str(&format!(" AND task_id = ?{}", params_vec.len()));
+        }
+        if let Some(s) = since {
+            params_vec.push(Box::new(s.to_string()));
+            sql.push_str(&format!(" AND timestamp >= ?{}", params_vec.len()));
+        }
+        if let Some(u) = until {
+            params_vec.push(Box::new(u.to_string()));
+            sql.push_str(&format!(" AND timestamp <= ?{}", params_vec.len()));
+        }
+
+        params_vec.push(Box::new(limit as i64));
+        sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{}", params_vec.len()));
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    payload: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            events.push(row.into_event()?);
+        }
+        Ok(events)
+    }
+
+    // -----------------------------------------------------------------------
+    // Export / Import
+    // -----------------------------------------------------------------------
+
+    /// Export all data for a project as JSON-serializable structs.
+    pub fn export_project_data(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<ProjectExportData, StorageError> {
+        let project = self
+            .get_project(project_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("project {}", project_id)))?;
+
+        let tasks = self.list_tasks_by_project(project_id)?;
+        let usage_records = self.list_usage_records(Some(project_id), None, None, 10000)?;
+        let actions = self.list_actions_for_project(project_id)?;
+
+        Ok(ProjectExportData {
+            project,
+            tasks,
+            usage_records,
+            actions,
+        })
+    }
+
+    /// List all actions for a project (all statuses).
+    pub fn list_actions_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<PendingAction>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action_type, project_id, task_id, description, payload, status, created_at
+                 FROM pending_actions WHERE project_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![project_id.0.to_string()], |row| {
+                Ok(PendingActionRow {
+                    id: row.get(0)?,
+                    action_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    description: row.get(4)?,
+                    payload: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut actions = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            actions.push(row.into_pending_action()?);
+        }
+        Ok(actions)
+    }
+
+    /// Import project data, skipping duplicates (by primary key).
+    pub fn import_project_data(&self, data: &ProjectExportData) -> Result<ImportResult, StorageError> {
+        let mut result = ImportResult::default();
+
+        // Import project (skip if exists)
+        match self.get_project(&data.project.id)? {
+            Some(_) => result.skipped_project = true,
+            None => {
+                self.insert_project(&data.project)?;
+                result.imported_project = true;
+            }
+        }
+
+        // Import tasks
+        for task in &data.tasks {
+            match self.get_task(&task.id)? {
+                Some(_) => result.skipped_tasks += 1,
+                None => {
+                    self.insert_task(task)?;
+                    result.imported_tasks += 1;
+                }
+            }
+        }
+
+        // Import usage records
+        for record in &data.usage_records {
+            // Check if exists by trying to insert (use OR IGNORE)
+            let result_inner = self.conn.execute(
+                "INSERT OR IGNORE INTO usage_records (id, task_id, project_id, backend_id, input_tokens, output_tokens, cost_cents, model, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.id.0.to_string(),
+                    record.task_id.0.to_string(),
+                    record.project_id.0.to_string(),
+                    record.backend_id.as_str(),
+                    record.input_tokens as i64,
+                    record.output_tokens as i64,
+                    record.cost.cents,
+                    record.model,
+                    record.recorded_at.to_rfc3339(),
+                ],
+            ).map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if result_inner > 0 {
+                result.imported_usage += 1;
+            } else {
+                result.skipped_usage += 1;
+            }
+        }
+
+        // Import actions
+        for action in &data.actions {
+            let action_type_str = serde_json::to_string(&action.action_type)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let status_str = serde_json::to_string(&action.status)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let payload_str = serde_json::to_string(&action.payload)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+            let rows = self.conn.execute(
+                "INSERT OR IGNORE INTO pending_actions (id, action_type, project_id, task_id, description, payload, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    action.id.0.to_string(),
+                    action_type_str,
+                    action.project_id.0.to_string(),
+                    action.task_id.as_ref().map(|t| t.0.to_string()),
+                    action.description,
+                    payload_str,
+                    status_str,
+                    action.created_at.to_rfc3339(),
+                ],
+            ).map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if rows > 0 {
+                result.imported_actions += 1;
+            } else {
+                result.skipped_actions += 1;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Data exported from a project for backup/migration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectExportData {
+    pub project: Project,
+    pub tasks: Vec<Task>,
+    pub usage_records: Vec<UsageRecord>,
+    pub actions: Vec<PendingAction>,
+}
+
+/// Result of an import operation.
+#[derive(Debug, Default)]
+pub struct ImportResult {
+    pub imported_project: bool,
+    pub skipped_project: bool,
+    pub imported_tasks: usize,
+    pub skipped_tasks: usize,
+    pub imported_usage: usize,
+    pub skipped_usage: usize,
+    pub imported_actions: usize,
+    pub skipped_actions: usize,
 }
 
 /// Thread-safe storage wrapper using a Mutex around the Connection.
@@ -1833,13 +2149,13 @@ mod tests {
     fn schema_v2_migration_creates_indexes() {
         let storage = SqliteStorage::in_memory().unwrap();
 
-        // Verify migration version is 3 (V1 + V2 indexes + V3 task_outputs)
+        // Verify migration version is 4 (V1 + V2 indexes + V3 task_outputs + V4 task_dependencies)
         let version: i64 = storage.conn.query_row(
             "SELECT MAX(version) FROM _migrations",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         // Verify indexes exist
         let index_count: i64 = storage.conn.query_row(

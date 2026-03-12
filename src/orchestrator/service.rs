@@ -581,6 +581,18 @@ impl Orchestrator {
         self.storage.list_events_recent(limit)
     }
 
+    pub fn filtered_events(
+        &self,
+        event_type: Option<&str>,
+        project_id: Option<&ProjectId>,
+        task_id: Option<&TaskId>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Event>, StorageError> {
+        self.storage.list_events_filtered(event_type, project_id, task_id, since, until, limit)
+    }
+
     // -----------------------------------------------------------------------
     // Tasks
     // -----------------------------------------------------------------------
@@ -628,6 +640,28 @@ impl Orchestrator {
 
         info!(task_id = %id.0, "task cancelled");
         Ok(())
+    }
+
+    /// Register task dependencies in storage.
+    pub fn add_task_dependencies(
+        &self,
+        task_id: &TaskId,
+        depends_on: &[TaskId],
+    ) -> Result<(), StorageError> {
+        for dep_id in depends_on {
+            self.storage.insert_task_dependency(task_id, dep_id)?;
+        }
+        Ok(())
+    }
+
+    /// Check if all dependencies for a task are completed.
+    pub fn check_dependencies(&self, task_id: &TaskId) -> Result<bool, StorageError> {
+        self.storage.all_dependencies_completed(task_id)
+    }
+
+    /// Get the list of dependency task IDs for a task.
+    pub fn get_task_dependencies(&self, task_id: &TaskId) -> Result<Vec<TaskId>, StorageError> {
+        self.storage.get_task_dependencies(task_id)
     }
 
     pub fn get_routing_history_for_task(
@@ -762,6 +796,8 @@ pub enum SubmitError {
     Routing(RoutingError),
     #[error("adapter error: {0}")]
     Adapter(AdapterError),
+    #[error("unsatisfied dependencies: {0}")]
+    UnsatisfiedDependencies(String),
 }
 
 #[derive(Debug, thiserror::Error)]

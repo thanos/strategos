@@ -64,6 +64,9 @@ pub enum Commands {
         /// Maximum cost in cents
         #[arg(long)]
         max_cost: Option<i64>,
+        /// Comma-separated task ID prefixes this task depends on
+        #[arg(long)]
+        depends_on: Option<String>,
     },
 
     /// Show budget status
@@ -74,6 +77,21 @@ pub enum Commands {
         /// Number of events to show
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Filter by event type (e.g. TaskSubmitted, TaskCompleted)
+        #[arg(long, name = "type")]
+        event_type: Option<String>,
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by task ID prefix
+        #[arg(long)]
+        task: Option<String>,
+        /// Show events since this date (YYYY-MM-DD or RFC3339)
+        #[arg(long)]
+        since: Option<String>,
+        /// Show events until this date (YYYY-MM-DD or RFC3339)
+        #[arg(long)]
+        until: Option<String>,
     },
 
     /// List tasks for a project
@@ -147,6 +165,21 @@ pub enum Commands {
         file: PathBuf,
     },
 
+    /// Preview routing decision without executing
+    DryRun {
+        /// Project name
+        #[arg(long)]
+        project: String,
+        /// Task type
+        #[arg(long, value_parser = parse_task_type)]
+        task_type: TaskType,
+        /// Task description / prompt
+        description: Vec<String>,
+        /// Override backend selection
+        #[arg(long)]
+        backend: Option<String>,
+    },
+
     /// Show current configuration
     Config,
 }
@@ -169,6 +202,19 @@ pub enum ProjectCommands {
     Remove {
         /// Project name
         name: String,
+    },
+    /// Export project data to JSON
+    Export {
+        /// Project name
+        name: String,
+        /// Output file path
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Import project data from JSON
+    Import {
+        /// Path to JSON file
+        file: PathBuf,
     },
 }
 
@@ -345,11 +391,14 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             max_tokens,
             timeout,
             max_cost,
+            depends_on,
         } => {
-            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost).await
+            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost, depends_on).await
         }
         Commands::Budget => cmd_budget(&config),
-        Commands::Events { limit } => cmd_events(&config, limit),
+        Commands::Events { limit, event_type, project, task, since, until } => {
+            cmd_events(&config, limit, event_type, project, task, since, until)
+        }
         Commands::Tasks { project } => cmd_tasks(&config, &project),
         Commands::Task(sub) => cmd_task(sub, &config).await,
         Commands::Actions(sub) => cmd_actions(sub, &config),
@@ -371,6 +420,12 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             limit,
         } => cmd_usage(&config, project.as_deref(), backend.as_deref(), days, limit),
         Commands::Batch { file } => cmd_batch(&config, &file).await,
+        Commands::DryRun {
+            project,
+            task_type,
+            description,
+            backend,
+        } => cmd_dry_run(&config, &project, task_type, &description.join(" "), backend).await,
         Commands::Config => cmd_config(&config, &cli.config_path),
     }
 }
@@ -426,6 +481,48 @@ fn cmd_project(sub: ProjectCommands, config: &GlobalConfig) -> Result<()> {
             storage.delete_project(&project.id)?;
             println!("Removed project '{}'", name);
         }
+        ProjectCommands::Export { name, output } => {
+            let project = storage
+                .get_project_by_name(&name)?
+                .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?;
+
+            let data = storage.export_project_data(&project.id)?;
+            let json = serde_json::to_string_pretty(&data)?;
+            std::fs::write(&output, &json)?;
+            println!(
+                "Exported project '{}': {} tasks, {} usage records, {} actions -> {}",
+                name,
+                data.tasks.len(),
+                data.usage_records.len(),
+                data.actions.len(),
+                output.display()
+            );
+        }
+        ProjectCommands::Import { file } => {
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("cannot read '{}': {}", file.display(), e))?;
+            let data: crate::storage::sqlite::ProjectExportData = serde_json::from_str(&content)?;
+            let result = storage.import_project_data(&data)?;
+
+            println!("Import from {}:", file.display());
+            if result.imported_project {
+                println!("  Project: imported");
+            } else {
+                println!("  Project: skipped (already exists)");
+            }
+            println!(
+                "  Tasks:   {} imported, {} skipped",
+                result.imported_tasks, result.skipped_tasks
+            );
+            println!(
+                "  Usage:   {} imported, {} skipped",
+                result.imported_usage, result.skipped_usage
+            );
+            println!(
+                "  Actions: {} imported, {} skipped",
+                result.imported_actions, result.skipped_actions
+            );
+        }
     }
 
     Ok(())
@@ -440,6 +537,7 @@ async fn cmd_submit(
     max_tokens: Option<u64>,
     timeout_secs: Option<u64>,
     max_cost_cents: Option<i64>,
+    depends_on: Option<String>,
 ) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
     let project = storage
@@ -451,6 +549,35 @@ async fn cmd_submit(
     let mut task = Task::new(project.id.clone(), task_type, description);
     if let Some(ref b) = backend_override {
         task.backend_override = Some(BackendId::new(b));
+    }
+
+    // Resolve and validate dependencies
+    let dep_ids = if let Some(ref deps_str) = depends_on {
+        let mut ids = Vec::new();
+        for prefix in deps_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let dep_id = resolve_task_id(&storage, prefix)?;
+            ids.push(dep_id);
+        }
+        ids
+    } else {
+        Vec::new()
+    };
+
+    // Store the task first so we can register dependencies
+    if !dep_ids.is_empty() {
+        // Pre-check: persist task, register deps, then check all completed
+        storage.insert_task(&task)?;
+        orchestrator.add_task_dependencies(&task.id, &dep_ids)?;
+
+        if !orchestrator.check_dependencies(&task.id)? {
+            // Unsatisfied — mark as failed and report
+            storage.update_task_status(&task.id, crate::models::task::TaskStatus::Failed)?;
+            let dep_strs: Vec<String> = dep_ids.iter().map(|d| d.0.to_string()[..8].to_string()).collect();
+            anyhow::bail!(
+                "Cannot submit: dependencies not all completed: [{}]",
+                dep_strs.join(", ")
+            );
+        }
     }
 
     let project_config = build_project_routing_config(config, &project);
@@ -575,9 +702,46 @@ fn cmd_budget(config: &GlobalConfig) -> Result<()> {
     Ok(())
 }
 
-fn cmd_events(config: &GlobalConfig, limit: usize) -> Result<()> {
+fn cmd_events(
+    config: &GlobalConfig,
+    limit: usize,
+    event_type: Option<String>,
+    project_name: Option<String>,
+    task_prefix: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+) -> Result<()> {
     let storage = open_storage(config)?;
-    let events = storage.list_events_recent(limit)?;
+
+    let has_filters = event_type.is_some() || project_name.is_some() || task_prefix.is_some() || since.is_some() || until.is_some();
+
+    let events = if has_filters {
+        let project_id = if let Some(ref name) = project_name {
+            let project = storage
+                .get_project_by_name(name)?
+                .ok_or_else(|| anyhow::anyhow!("project '{}' not found", name))?;
+            Some(project.id)
+        } else {
+            None
+        };
+
+        let task_id = if let Some(ref prefix) = task_prefix {
+            Some(resolve_task_id(&storage, prefix)?)
+        } else {
+            None
+        };
+
+        storage.list_events_filtered(
+            event_type.as_deref(),
+            project_id.as_ref(),
+            task_id.as_ref(),
+            since.as_deref(),
+            until.as_deref(),
+            limit,
+        )?
+    } else {
+        storage.list_events_recent(limit)?
+    };
 
     if events.is_empty() {
         println!("No events recorded.");
@@ -601,6 +765,7 @@ fn cmd_events(config: &GlobalConfig, limit: usize) -> Result<()> {
         println!("{:<24} {:<28} {}", ts, format!("{:?}", event.event_type), details_short);
     }
 
+    println!("\n{} event(s)", events.len());
     Ok(())
 }
 
@@ -799,6 +964,19 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                 }
                 if routing.budget_downgrade_applied {
                     println!("  Budget downgrade: yes");
+                }
+            }
+
+            // Show dependencies
+            let deps = storage.get_task_dependencies(&task_id)?;
+            if !deps.is_empty() {
+                println!("\nDependencies:");
+                for dep_id in &deps {
+                    let status = storage
+                        .get_task(dep_id)?
+                        .map(|t| format!("{:?}", t.status))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!("  {} ({})", &dep_id.0.to_string()[..8], status);
                 }
             }
 
@@ -1467,6 +1645,88 @@ async fn cmd_batch(config: &GlobalConfig, file: &PathBuf) -> Result<()> {
         "Batch complete: {} succeeded, {} failed, total cost: {}",
         succeeded, failed, total_cost
     );
+
+    Ok(())
+}
+
+async fn cmd_dry_run(
+    config: &GlobalConfig,
+    project_name: &str,
+    task_type: TaskType,
+    description: &str,
+    backend_override: Option<String>,
+) -> Result<()> {
+    let storage = Arc::new(open_storage(config)?);
+    let project = storage
+        .get_project_by_name(project_name)?
+        .ok_or_else(|| anyhow::anyhow!("project '{}' not found", project_name))?;
+
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
+
+    let mut task = Task::new(project.id.clone(), task_type, description);
+    if let Some(ref b) = backend_override {
+        task.backend_override = Some(BackendId::new(b));
+    }
+
+    let project_config = build_project_routing_config(config, &project);
+    let estimated_cost = estimate_task_cost(
+        description,
+        &config.default_backend,
+        config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+    );
+
+    let routing_request = crate::routing::engine::RoutingRequest {
+        task_id: task.id.clone(),
+        task_type: task.task_type,
+        project_id: task.project_id.clone(),
+        project_config,
+        backend_override: task.backend_override.clone(),
+        estimated_cost,
+    };
+
+    println!("Dry-run routing for {:?} task in '{}'...\n", task_type, project_name);
+
+    match orchestrator.routing_engine.route(routing_request).await {
+        Ok(decision) => {
+            println!("Selected backend: {}", decision.selected_backend);
+            println!("Reason:           {:?}", decision.reason);
+            println!("Fallback applied: {}", decision.fallback_applied);
+            println!("Budget downgrade: {}", decision.budget_downgrade_applied);
+
+            if !decision.evaluated_backends.is_empty() {
+                println!("\nEvaluated backends:");
+                for eval in &decision.evaluated_backends {
+                    let status = if eval.eligible {
+                        "eligible"
+                    } else {
+                        "rejected"
+                    };
+                    let reason = eval.rejection_reason.as_deref().unwrap_or("-");
+                    println!("  {:<15} {:<10} {}", eval.backend_id, status, reason);
+                }
+            }
+
+            println!("\nEstimated cost: {}", estimated_cost);
+
+            // Show budget state
+            let year_month = Utc::now().format("%Y-%m").to_string();
+            let global_limit = MoneyAmount::from_dollars(config.monthly_budget_dollars);
+            if let Ok(summary) = orchestrator.budget_summary(global_limit, &year_month) {
+                println!(
+                    "Budget:          {} / {} ({}%)",
+                    summary.global_spent,
+                    summary.global_limit,
+                    summary.global_spent.percentage_of(summary.global_limit)
+                );
+            }
+
+            println!("\nNo task was created. This was a dry run.");
+        }
+        Err(e) => {
+            println!("Routing failed: {}", e);
+            println!("\nNo task was created. This was a dry run.");
+        }
+    }
 
     Ok(())
 }
