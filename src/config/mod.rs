@@ -13,6 +13,8 @@ pub struct GlobalConfig {
     pub monthly_budget_dollars: f64,
     pub budget_mode: BudgetMode,
     pub storage_path: Option<PathBuf>,
+    pub log_level: Option<String>,
+    pub fallback_chain: Option<Vec<BackendId>>,
     pub backends: BackendsConfig,
     pub projects: Vec<ProjectConfig>,
 }
@@ -115,12 +117,130 @@ impl GlobalConfig {
             .unwrap_or_else(Self::default_storage_path)
     }
 
+    /// Look up a project config by name.
+    pub fn find_project(&self, name: &str) -> Option<&ProjectConfig> {
+        self.projects.iter().find(|p| p.name == name)
+    }
+
+    /// Returns the list of configured backend names.
+    pub fn configured_backends(&self) -> Vec<&str> {
+        let mut backends = Vec::new();
+        if self.backends.claude.is_some() {
+            backends.push("claude");
+        }
+        if self.backends.ollama.is_some() {
+            backends.push("ollama");
+        }
+        if self.backends.opencode.is_some() {
+            backends.push("opencode");
+        }
+        backends
+    }
+
+    /// Validate config and return errors if any.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let known_backends = self.configured_backends();
+
+        // default_backend must reference a configured backend
+        if !known_backends.contains(&self.default_backend.as_str()) {
+            errors.push(format!(
+                "default_backend '{}' is not a configured backend (available: {})",
+                self.default_backend,
+                known_backends.join(", ")
+            ));
+        }
+
+        // Budget amounts must be non-negative
+        if self.monthly_budget_dollars < 0.0 {
+            errors.push("monthly_budget_dollars must be non-negative".into());
+        }
+
+        // Global fallback chain must reference configured backends
+        if let Some(ref chain) = self.fallback_chain {
+            for backend in chain {
+                if !known_backends.contains(&backend.as_str()) {
+                    errors.push(format!(
+                        "fallback_chain references unknown backend '{}'",
+                        backend
+                    ));
+                }
+            }
+        }
+
+        // Per-project validation
+        let mut project_names = std::collections::HashSet::new();
+        for project in &self.projects {
+            if !project_names.insert(&project.name) {
+                errors.push(format!("duplicate project name '{}'", project.name));
+            }
+
+            if let Some(ref backend) = project.default_backend {
+                if !known_backends.contains(&backend.as_str()) {
+                    errors.push(format!(
+                        "project '{}': default_backend '{}' is not a configured backend",
+                        project.name, backend
+                    ));
+                }
+            }
+
+            if let Some(ref chain) = project.fallback_chain {
+                for backend in chain {
+                    if !known_backends.contains(&backend.as_str()) {
+                        errors.push(format!(
+                            "project '{}': fallback_chain references unknown backend '{}'",
+                            project.name, backend
+                        ));
+                    }
+                }
+            }
+
+            if let Some(budget) = project.monthly_budget_dollars {
+                if budget < 0.0 {
+                    errors.push(format!(
+                        "project '{}': monthly_budget_dollars must be non-negative",
+                        project.name
+                    ));
+                }
+            }
+
+            if let Some(ref overrides) = project.task_overrides {
+                let valid_task_types = [
+                    "deep-code-reasoning", "planning", "review", "commit-preparation",
+                    "summarization", "backlog-triage", "low-cost-drafting", "private-local",
+                    "experimental",
+                ];
+                for (key, backend) in overrides {
+                    if !valid_task_types.contains(&key.as_str()) {
+                        errors.push(format!(
+                            "project '{}': unknown task type '{}' in task_overrides",
+                            project.name, key
+                        ));
+                    }
+                    if !known_backends.contains(&backend.as_str()) {
+                        errors.push(format!(
+                            "project '{}': task_overrides '{}' references unknown backend '{}'",
+                            project.name, key, backend
+                        ));
+                    }
+                }
+            }
+        }
+
+        errors
+    }
+
     pub fn sample() -> Self {
         Self {
             default_backend: BackendId::new("claude"),
             monthly_budget_dollars: 100.0,
             budget_mode: BudgetMode::Govern,
             storage_path: None,
+            log_level: Some("info".into()),
+            fallback_chain: Some(vec![
+                BackendId::new("claude"),
+                BackendId::new("ollama"),
+            ]),
             backends: BackendsConfig {
                 claude: Some(ClaudeBackendConfig {
                     api_key_env: "ANTHROPIC_API_KEY".into(),
@@ -134,16 +254,32 @@ impl GlobalConfig {
                 }),
                 opencode: None,
             },
-            projects: vec![ProjectConfig {
-                name: "my-project".into(),
-                path: PathBuf::from("/home/user/projects/my-project"),
-                default_backend: None,
-                fallback_chain: None,
-                monthly_budget_dollars: Some(20.0),
-                privacy: Some(PrivacyLevel::Public),
-                tags: Some(vec!["rust".into(), "backend".into()]),
-                task_overrides: None,
-            }],
+            projects: vec![
+                ProjectConfig {
+                    name: "my-project".into(),
+                    path: PathBuf::from("/home/user/projects/my-project"),
+                    default_backend: None,
+                    fallback_chain: None,
+                    monthly_budget_dollars: Some(20.0),
+                    privacy: Some(PrivacyLevel::Public),
+                    tags: Some(vec!["rust".into(), "backend".into()]),
+                    task_overrides: Some({
+                        let mut m = HashMap::new();
+                        m.insert("summarization".into(), BackendId::new("ollama"));
+                        m
+                    }),
+                },
+                ProjectConfig {
+                    name: "private-research".into(),
+                    path: PathBuf::from("/home/user/projects/private-research"),
+                    default_backend: Some(BackendId::new("ollama")),
+                    fallback_chain: Some(vec![BackendId::new("ollama")]),
+                    monthly_budget_dollars: Some(5.0),
+                    privacy: Some(PrivacyLevel::LocalOnly),
+                    tags: Some(vec!["research".into()]),
+                    task_overrides: None,
+                },
+            ],
         }
     }
 }
@@ -232,5 +368,100 @@ mod tests {
 
         let storage_path = GlobalConfig::default_storage_path();
         assert!(storage_path.to_string_lossy().contains("strategos"));
+    }
+
+    #[test]
+    fn sample_config_validates_ok() {
+        let config = GlobalConfig::sample();
+        let errors = config.validate();
+        assert!(errors.is_empty(), "sample config should validate: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_unknown_default_backend() {
+        let mut config = GlobalConfig::sample();
+        config.default_backend = BackendId::new("nonexistent");
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("default_backend") && e.contains("nonexistent")));
+    }
+
+    #[test]
+    fn validate_negative_budget() {
+        let mut config = GlobalConfig::sample();
+        config.monthly_budget_dollars = -10.0;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("non-negative")));
+    }
+
+    #[test]
+    fn validate_duplicate_project_names() {
+        let mut config = GlobalConfig::sample();
+        config.projects.push(ProjectConfig {
+            name: "my-project".into(),
+            path: PathBuf::from("/tmp/dup"),
+            default_backend: None,
+            fallback_chain: None,
+            monthly_budget_dollars: None,
+            privacy: None,
+            tags: None,
+            task_overrides: None,
+        });
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("duplicate project name")));
+    }
+
+    #[test]
+    fn validate_unknown_backend_in_fallback_chain() {
+        let mut config = GlobalConfig::sample();
+        config.fallback_chain = Some(vec![
+            BackendId::new("claude"),
+            BackendId::new("mystery"),
+        ]);
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("fallback_chain") && e.contains("mystery")));
+    }
+
+    #[test]
+    fn validate_unknown_task_type_in_overrides() {
+        let mut config = GlobalConfig::sample();
+        let mut overrides = HashMap::new();
+        overrides.insert("not-a-task".into(), BackendId::new("claude"));
+        config.projects[0].task_overrides = Some(overrides);
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("unknown task type") && e.contains("not-a-task")));
+    }
+
+    #[test]
+    fn validate_project_backend_references() {
+        let mut config = GlobalConfig::sample();
+        config.projects[0].default_backend = Some(BackendId::new("ghost"));
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("ghost") && e.contains("not a configured backend")));
+    }
+
+    #[test]
+    fn find_project_by_name() {
+        let config = GlobalConfig::sample();
+        assert!(config.find_project("my-project").is_some());
+        assert!(config.find_project("private-research").is_some());
+        assert!(config.find_project("nonexistent").is_none());
+    }
+
+    #[test]
+    fn sample_config_includes_log_level_and_fallback() {
+        let config = GlobalConfig::sample();
+        assert_eq!(config.log_level.as_deref(), Some("info"));
+        assert!(config.fallback_chain.is_some());
+        let chain = config.fallback_chain.unwrap();
+        assert!(chain.len() >= 2);
+    }
+
+    #[test]
+    fn sample_config_includes_task_overrides() {
+        let config = GlobalConfig::sample();
+        let pc = config.find_project("my-project").unwrap();
+        assert!(pc.task_overrides.is_some());
+        let overrides = pc.task_overrides.as_ref().unwrap();
+        assert!(overrides.contains_key("summarization"));
     }
 }

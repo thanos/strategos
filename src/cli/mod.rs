@@ -33,7 +33,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub enum Commands {
     /// Initialize configuration file
     Init,
 
@@ -110,7 +110,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum ProjectCommands {
+pub enum ProjectCommands {
     /// Add a project
     Add {
         /// Project name
@@ -131,7 +131,7 @@ enum ProjectCommands {
 }
 
 #[derive(Subcommand)]
-enum ActionCommands {
+pub enum ActionCommands {
     /// List pending actions
     List {
         /// Show all actions (not just pending)
@@ -159,7 +159,7 @@ enum ActionCommands {
 }
 
 #[derive(Subcommand)]
-enum TaskCommands {
+pub enum TaskCommands {
     /// Show detailed task information
     Show {
         /// Task ID (UUID prefix)
@@ -207,18 +207,28 @@ fn parse_privacy(s: &str) -> Result<PrivacyLevel> {
     }
 }
 
-pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Parsed CLI state including the resolved config and config path.
+pub struct ParsedCli {
+    pub config_path: PathBuf,
+    pub command: Commands,
+}
 
+/// Parse CLI args and load config. Called from main before tracing init.
+pub fn parse_config() -> Result<(GlobalConfig, ParsedCli)> {
+    let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(GlobalConfig::default_path);
     let config = if config_path.exists() {
         GlobalConfig::load(&config_path)?
     } else {
         GlobalConfig::sample()
     };
+    Ok((config, ParsedCli { config_path, command: cli.command }))
+}
 
+/// Run the CLI with pre-loaded config. Called from main after tracing init.
+pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
     match cli.command {
-        Commands::Init => cmd_init(&config_path, &config),
+        Commands::Init => cmd_init(&cli.config_path, &config),
         Commands::Project(sub) => cmd_project(sub, &config),
         Commands::Submit {
             project,
@@ -242,7 +252,7 @@ pub async fn run() -> Result<()> {
             files,
             backend,
         } => cmd_review(&config, &project, &files, backend).await,
-        Commands::Config => cmd_config(&config, &config_path),
+        Commands::Config => cmd_config(&config, &cli.config_path),
     }
 }
 
@@ -314,26 +324,14 @@ async fn cmd_submit(
         .get_project_by_name(project_name)?
         .ok_or_else(|| anyhow::anyhow!("project '{}' not found", project_name))?;
 
-    let (registry, governor) = build_runtime(config)?;
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::clone(&governor),
-    );
-
-    let orchestrator = Orchestrator::new(registry, routing_engine, governor, storage);
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
 
     let mut task = Task::new(project.id.clone(), task_type, description);
     if let Some(ref b) = backend_override {
         task.backend_override = Some(BackendId::new(b));
     }
 
-    let project_config = ProjectRoutingConfig {
-        default_backend: project.default_backend.clone(),
-        fallback_chain: project.fallback_chain.clone(),
-        privacy: project.privacy,
-        task_overrides: HashMap::new(),
-    };
+    let project_config = build_project_routing_config(config, &project);
 
     println!("Submitting {:?} task to project '{}'...", task_type, project_name);
 
@@ -345,6 +343,14 @@ async fn cmd_submit(
         "Routed to: {} (reason: {:?})",
         result.routing_decision.selected_backend, result.routing_decision.reason
     );
+
+    if result.requires_approval {
+        println!("\nBudget approval required. Task queued for review.");
+        if let Some(ref action_id) = result.pending_action_id {
+            println!("Approve with: strategos actions approve {}", &action_id.0.to_string()[..8]);
+        }
+        return Ok(());
+    }
 
     if result.routing_decision.budget_downgrade_applied {
         println!("  (budget downgrade applied)");
@@ -375,29 +381,10 @@ async fn cmd_submit(
 
 fn cmd_budget(config: &GlobalConfig) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
-    let (registry, _) = build_runtime(config)?;
+    let orchestrator = build_orchestrator(config, storage)?;
 
     let year_month = Utc::now().format("%Y-%m").to_string();
     let global_limit = MoneyAmount::from_dollars(config.monthly_budget_dollars);
-
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::new(BudgetGovernor::new(
-            BudgetConfig::default(),
-            Arc::new(InMemoryUsageStore::new()),
-        )),
-    );
-
-    let orchestrator = Orchestrator::new(
-        registry,
-        routing_engine,
-        Arc::new(BudgetGovernor::new(
-            BudgetConfig::default(),
-            Arc::new(InMemoryUsageStore::new()),
-        )),
-        storage,
-    );
 
     let summary = orchestrator.budget_summary(global_limit, &year_month)?;
 
@@ -510,13 +497,7 @@ fn cmd_tasks(config: &GlobalConfig, project_name: &str) -> Result<()> {
 
 fn cmd_actions(sub: ActionCommands, config: &GlobalConfig) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
-    let (registry, governor) = build_runtime(config)?;
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::clone(&governor),
-    );
-    let orchestrator = Orchestrator::new(registry, routing_engine, governor, storage);
+    let orchestrator = build_orchestrator(config, storage)?;
 
     match sub {
         ActionCommands::List { all, limit } => {
@@ -712,13 +693,7 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                 .get_project(&original.project_id)?
                 .ok_or_else(|| anyhow::anyhow!("project not found for task"))?;
 
-            let (registry, governor) = build_runtime(config)?;
-            let routing_engine = RoutingEngine::new(
-                RoutingPolicy::default(),
-                Arc::clone(&registry),
-                Arc::clone(&governor),
-            );
-            let orchestrator = Orchestrator::new(registry, routing_engine, governor, storage);
+            let orchestrator = build_orchestrator(config, storage)?;
 
             let mut new_task =
                 Task::new(original.project_id.clone(), original.task_type, &original.description);
@@ -728,12 +703,7 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                 new_task.backend_override = Some(b.clone());
             }
 
-            let project_config = ProjectRoutingConfig {
-                default_backend: project.default_backend.clone(),
-                fallback_chain: project.fallback_chain.clone(),
-                privacy: project.privacy,
-                task_overrides: HashMap::new(),
-            };
+            let project_config = build_project_routing_config(config, &project);
 
             println!(
                 "Retrying {:?} task (original: {})...",
@@ -768,13 +738,7 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
 
 fn cmd_status(config: &GlobalConfig) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
-    let (registry, governor) = build_runtime(config)?;
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::clone(&governor),
-    );
-    let orchestrator = Orchestrator::new(registry, routing_engine, governor, storage);
+    let orchestrator = build_orchestrator(config, storage)?;
 
     let entries = orchestrator.project_status_summary()?;
 
@@ -883,25 +847,14 @@ async fn cmd_prepare_commit(
         diff
     );
 
-    let (registry, governor) = build_runtime(config)?;
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::clone(&governor),
-    );
-    let orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage));
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
 
     let mut task = Task::new(project.id.clone(), TaskType::CommitPreparation, &prompt);
     if let Some(ref b) = backend_override {
         task.backend_override = Some(BackendId::new(b));
     }
 
-    let project_config = ProjectRoutingConfig {
-        default_backend: project.default_backend.clone(),
-        fallback_chain: project.fallback_chain.clone(),
-        privacy: project.privacy,
-        task_overrides: HashMap::new(),
-    };
+    let project_config = build_project_routing_config(config, &project);
 
     println!("Preparing commit message for '{}'...", project_name);
 
@@ -959,25 +912,14 @@ async fn cmd_review(
         project_name, file_context
     );
 
-    let (registry, governor) = build_runtime(config)?;
-    let routing_engine = RoutingEngine::new(
-        RoutingPolicy::default(),
-        Arc::clone(&registry),
-        Arc::clone(&governor),
-    );
-    let orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage));
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
 
     let mut task = Task::new(project.id.clone(), TaskType::Review, &prompt);
     if let Some(ref b) = backend_override {
         task.backend_override = Some(BackendId::new(b));
     }
 
-    let project_config = ProjectRoutingConfig {
-        default_backend: project.default_backend.clone(),
-        fallback_chain: project.fallback_chain.clone(),
-        privacy: project.privacy,
-        task_overrides: HashMap::new(),
-    };
+    let project_config = build_project_routing_config(config, &project);
 
     println!("Submitting review for '{}'...", project_name);
 
@@ -1017,16 +959,67 @@ fn cmd_config(config: &GlobalConfig, config_path: &PathBuf) -> Result<()> {
     println!("Default backend: {}", config.default_backend);
     println!("Budget mode: {:?}", config.budget_mode);
     println!("Monthly budget: ${:.2}", config.monthly_budget_dollars);
+    if let Some(ref level) = config.log_level {
+        println!("Log level: {}", level);
+    }
+    if let Some(ref chain) = config.fallback_chain {
+        let chain_str: Vec<_> = chain.iter().map(|b| b.as_str()).collect();
+        println!("Fallback chain: {}", chain_str.join(" -> "));
+    }
+
     println!("\nBackends:");
     if let Some(ref claude) = config.backends.claude {
-        println!("  claude: model={}, key_env={}", claude.model, claude.api_key_env);
+        print!("  claude: model={}, key_env={}", claude.model, claude.api_key_env);
+        if let Some(budget) = claude.monthly_budget_dollars {
+            print!(", budget=${:.2}", budget);
+        }
+        println!();
     }
     if let Some(ref ollama) = config.backends.ollama {
-        println!("  ollama: model={}, endpoint={}", ollama.model, ollama.endpoint);
+        print!("  ollama: model={}, endpoint={}", ollama.model, ollama.endpoint);
+        if let Some(budget) = ollama.monthly_budget_dollars {
+            print!(", budget=${:.2}", budget);
+        }
+        println!();
     }
     if config.backends.opencode.is_some() {
         println!("  opencode: configured");
     }
+
+    if !config.projects.is_empty() {
+        println!("\nProjects (from config):");
+        for pc in &config.projects {
+            print!("  {}: path={}", pc.name, pc.path.display());
+            if let Some(ref backend) = pc.default_backend {
+                print!(", backend={}", backend);
+            }
+            if let Some(budget) = pc.monthly_budget_dollars {
+                print!(", budget=${:.2}", budget);
+            }
+            if let Some(ref privacy) = pc.privacy {
+                print!(", privacy={:?}", privacy);
+            }
+            if let Some(ref overrides) = pc.task_overrides {
+                if !overrides.is_empty() {
+                    let pairs: Vec<_> = overrides.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    print!(", task_overrides=[{}]", pairs.join(", "));
+                }
+            }
+            println!();
+        }
+    }
+
+    // Validation
+    let errors = config.validate();
+    if errors.is_empty() {
+        println!("\nValidation: OK");
+    } else {
+        println!("\nValidation errors:");
+        for err in &errors {
+            println!("  - {}", err);
+        }
+    }
+
     Ok(())
 }
 
@@ -1039,8 +1032,73 @@ fn open_storage(config: &GlobalConfig) -> Result<SqliteStorage> {
     Ok(SqliteStorage::open(&path)?)
 }
 
+/// Build a fully wired Orchestrator from config and shared storage.
+fn build_orchestrator(
+    config: &GlobalConfig,
+    storage: Arc<SqliteStorage>,
+) -> Result<Orchestrator> {
+    let (registry, governor) = build_runtime(config, &storage)?;
+    let routing_engine = RoutingEngine::new(
+        build_routing_policy(config),
+        Arc::clone(&registry),
+        Arc::clone(&governor),
+    );
+    Ok(Orchestrator::new(registry, routing_engine, governor, storage))
+}
+
+/// Build ProjectRoutingConfig from TOML config and stored project data.
+fn build_project_routing_config(
+    config: &GlobalConfig,
+    project: &Project,
+) -> ProjectRoutingConfig {
+    // Start with stored project data
+    let mut routing_config = ProjectRoutingConfig {
+        default_backend: project.default_backend.clone(),
+        fallback_chain: project.fallback_chain.clone(),
+        privacy: project.privacy,
+        task_overrides: HashMap::new(),
+    };
+
+    // Overlay TOML config if present
+    if let Some(pc) = config.find_project(&project.name) {
+        if routing_config.default_backend.is_none() {
+            routing_config.default_backend = pc.default_backend.clone();
+        }
+        if routing_config.fallback_chain.is_empty() {
+            if let Some(ref chain) = pc.fallback_chain {
+                routing_config.fallback_chain = chain.clone();
+            }
+        }
+        if let Some(ref privacy) = pc.privacy {
+            routing_config.privacy = *privacy;
+        }
+        if let Some(ref overrides) = pc.task_overrides {
+            for (key, backend) in overrides {
+                if let Ok(tt) = parse_task_type(key) {
+                    routing_config.task_overrides.insert(tt, backend.clone());
+                }
+            }
+        }
+    }
+
+    routing_config
+}
+
+/// Build RoutingPolicy from config (with defaults as fallback).
+fn build_routing_policy(config: &GlobalConfig) -> RoutingPolicy {
+    let mut policy = RoutingPolicy::default();
+
+    // Override global fallback chain from config
+    if let Some(ref chain) = config.fallback_chain {
+        policy.global_fallback_chain = chain.clone();
+    }
+
+    policy
+}
+
 fn build_runtime(
     config: &GlobalConfig,
+    storage: &SqliteStorage,
 ) -> Result<(Arc<AdapterRegistry>, Arc<BudgetGovernor>)> {
     let mut registry = AdapterRegistry::new();
 
@@ -1081,6 +1139,17 @@ fn build_runtime(
         }
     }
 
+    // Populate per-project budget limits from config
+    let mut project_limits = HashMap::new();
+    for pc in &config.projects {
+        if let Some(budget) = pc.monthly_budget_dollars {
+            // Look up the project in storage to get its ProjectId
+            if let Ok(Some(project)) = storage.get_project_by_name(&pc.name) {
+                project_limits.insert(project.id, MoneyAmount::from_dollars(budget));
+            }
+        }
+    }
+
     let mut downgrade_map = HashMap::new();
     downgrade_map.insert(BackendId::new("claude"), BackendId::new("ollama"));
     downgrade_map.insert(BackendId::new("opencode"), BackendId::new("ollama"));
@@ -1096,7 +1165,7 @@ fn build_runtime(
         mode: config.budget_mode,
         global_monthly_limit: MoneyAmount::from_dollars(config.monthly_budget_dollars),
         backend_limits,
-        project_limits: HashMap::new(),
+        project_limits,
         thresholds: vec![50, 75, 90, 100],
         downgrade_map,
     };

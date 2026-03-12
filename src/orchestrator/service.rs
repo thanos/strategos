@@ -5,6 +5,8 @@ use tracing::{info, warn};
 use crate::adapters::traits::{AdapterRegistry, ExecutionRequest, ExecutionStatus};
 use crate::budget::governor::BudgetGovernor;
 use crate::errors::{AdapterError, RoutingError, StorageError};
+#[allow(unused_imports)]
+use crate::routing::engine::RoutingReason;
 use crate::models::event::{Event, EventType};
 use crate::models::policy::{ActionStatus, PendingAction};
 use crate::models::project::Project;
@@ -30,6 +32,10 @@ pub struct SubmitResult {
     pub routing_decision: RoutingDecision,
     pub execution_output: Option<String>,
     pub usage: Option<UsageRecord>,
+    /// Set when the task requires budget approval before execution.
+    pub requires_approval: bool,
+    /// The pending action ID if approval was created.
+    pub pending_action_id: Option<ActionId>,
 }
 
 /// Summary of budget state across all scopes.
@@ -130,11 +136,122 @@ impl Orchestrator {
             estimated_cost,
         };
 
-        let decision = self
-            .routing_engine
-            .route(routing_request)
-            .await
-            .map_err(SubmitError::Routing)?;
+        let decision = match self.routing_engine.route(routing_request).await {
+            Ok(d) => d,
+            Err(RoutingError::AllFallbacksFailed(ref evals))
+                if evals.iter().any(|e| {
+                    e.rejection_reason
+                        .as_ref()
+                        .map(|r| r.contains("budget approval") || r.contains("budget blocked"))
+                        .unwrap_or(false)
+                }) =>
+            {
+                let reason = evals
+                    .iter()
+                    .filter_map(|e| e.rejection_reason.as_ref())
+                    .find(|r| r.contains("budget"))
+                    .cloned()
+                    .unwrap_or_else(|| "budget limit reached".into());
+
+                // Budget requires approval — create a pending action
+                let action = PendingAction::new(
+                    crate::models::policy::PendingActionType::BudgetApproval,
+                    task.project_id.clone(),
+                    format!(
+                        "Budget approval required for {:?} task: {}",
+                        task.task_type, reason
+                    ),
+                )
+                .with_task(task.id.clone())
+                .with_payload(serde_json::json!({
+                    "task_type": format!("{:?}", task.task_type),
+                    "description": task.description,
+                    "reason": reason,
+                }));
+
+                let _ = self.storage.insert_pending_action(&action);
+                let _ = self.storage.insert_event(
+                    &Event::new(
+                        EventType::ActionCreated,
+                        serde_json::json!({
+                            "action_type": "BudgetApproval",
+                            "reason": reason,
+                        }),
+                    )
+                    .with_project(task.project_id.clone())
+                    .with_task(task.id.clone()),
+                );
+
+                let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+
+                return Ok(SubmitResult {
+                    task,
+                    routing_decision: RoutingDecision {
+                        selected_backend: BackendId::new("none"),
+                        reason: crate::routing::engine::RoutingReason::BudgetDowngrade {
+                            original: BackendId::new("blocked"),
+                        },
+                        fallback_applied: false,
+                        budget_downgrade_applied: false,
+                        evaluated_backends: Vec::new(),
+                    },
+                    execution_output: None,
+                    usage: None,
+                    requires_approval: true,
+                    pending_action_id: Some(action.id),
+                });
+            }
+            Err(RoutingError::BudgetBlocked(reason)) => {
+                // Budget requires approval — create a pending action
+                let action = PendingAction::new(
+                    crate::models::policy::PendingActionType::BudgetApproval,
+                    task.project_id.clone(),
+                    format!(
+                        "Budget approval required for {:?} task: {}",
+                        task.task_type, reason
+                    ),
+                )
+                .with_task(task.id.clone())
+                .with_payload(serde_json::json!({
+                    "task_type": format!("{:?}", task.task_type),
+                    "description": task.description,
+                    "reason": reason,
+                }));
+
+                let _ = self.storage.insert_pending_action(&action);
+                let _ = self.storage.insert_event(
+                    &Event::new(
+                        EventType::ActionCreated,
+                        serde_json::json!({
+                            "action_type": "BudgetApproval",
+                            "reason": reason,
+                        }),
+                    )
+                    .with_project(task.project_id.clone())
+                    .with_task(task.id.clone()),
+                );
+
+                let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+
+                return Ok(SubmitResult {
+                    task,
+                    routing_decision: RoutingDecision {
+                        selected_backend: BackendId::new("none"),
+                        reason: crate::routing::engine::RoutingReason::BudgetDowngrade {
+                            original: BackendId::new("blocked"),
+                        },
+                        fallback_applied: false,
+                        budget_downgrade_applied: false,
+                        evaluated_backends: Vec::new(),
+                    },
+                    execution_output: None,
+                    usage: None,
+                    requires_approval: true,
+                    pending_action_id: Some(action.id),
+                });
+            }
+            Err(e) => return Err(SubmitError::Routing(e)),
+        };
 
         info!(
             task_id = %task.id,
@@ -213,6 +330,8 @@ impl Orchestrator {
                     routing_decision: decision,
                     execution_output: None,
                     usage: None,
+                    requires_approval: false,
+                    pending_action_id: None,
                 });
             }
         };
@@ -273,6 +392,8 @@ impl Orchestrator {
             routing_decision: decision,
             execution_output: output,
             usage: usage_record,
+            requires_approval: false,
+            pending_action_id: None,
         })
     }
 

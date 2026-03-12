@@ -357,3 +357,37 @@ async fn orchestrator_actions_linked_to_task() {
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].description, "review findings");
 }
+
+// -----------------------------------------------------------------------
+// Phase 5: Budget approval workflow test
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_budget_approval_creates_pending_action() {
+    // Set up with Govern mode at 95% spend — triggers RequireApproval at 90% threshold
+    let (orchestrator, project) =
+        setup_orchestrator(BudgetMode::Govern, MoneyAmount::from_dollars(95.0));
+
+    let task = Task::new(project.id.clone(), TaskType::Planning, "plan something");
+
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(100))
+        .await
+        .unwrap();
+
+    // Should require approval
+    assert!(result.requires_approval, "expected requires_approval=true at 95% budget");
+    assert!(result.pending_action_id.is_some());
+
+    // Should have created a BudgetApproval pending action
+    let pending = orchestrator.list_pending_actions().unwrap();
+    assert!(
+        pending.iter().any(|a| a.action_type == PendingActionType::BudgetApproval),
+        "expected a BudgetApproval pending action"
+    );
+
+    // Should have emitted an ActionCreated event
+    let events = orchestrator.recent_events(20).unwrap();
+    use strategos::models::event::EventType;
+    assert!(events.iter().any(|e| e.event_type == EventType::ActionCreated));
+}
