@@ -15,6 +15,9 @@ pub enum EventType {
     BackendDowngradeApplied,
     ReviewQueued,
     CommitSuggested,
+    ActionCreated,
+    ActionApproved,
+    ActionDismissed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

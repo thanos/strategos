@@ -6,10 +6,12 @@ use crate::adapters::traits::{AdapterRegistry, ExecutionRequest, ExecutionStatus
 use crate::budget::governor::BudgetGovernor;
 use crate::errors::{AdapterError, RoutingError, StorageError};
 use crate::models::event::{Event, EventType};
+use crate::models::policy::{ActionStatus, PendingAction};
 use crate::models::project::Project;
 use crate::models::task::{Task, TaskStatus};
 use crate::models::usage::UsageRecord;
-use crate::models::{BackendId, MoneyAmount, ProjectId};
+use crate::models::{ActionId, BackendId, MoneyAmount, ProjectId, TaskId};
+use crate::storage::sqlite::RoutingHistoryRow;
 use crate::routing::engine::{ProjectRoutingConfig, RoutingDecision, RoutingEngine, RoutingRequest};
 use crate::storage::sqlite::SqliteStorage;
 
@@ -36,6 +38,14 @@ pub struct BudgetSummary {
     pub global_limit: MoneyAmount,
     pub backend_spend: Vec<(BackendId, MoneyAmount)>,
     pub project_spend: Vec<(ProjectId, String, MoneyAmount)>,
+}
+
+/// Per-project status for the overview dashboard.
+pub struct ProjectStatusEntry {
+    pub name: String,
+    pub task_counts: Vec<(TaskStatus, usize)>,
+    pub pending_actions: usize,
+    pub month_spend: MoneyAmount,
 }
 
 impl Orchestrator {
@@ -317,6 +327,133 @@ impl Orchestrator {
 
     pub fn list_tasks(&self, project_id: &ProjectId) -> Result<Vec<Task>, StorageError> {
         self.storage.list_tasks_by_project(project_id)
+    }
+
+    pub fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StorageError> {
+        self.storage.get_task(id)
+    }
+
+    pub fn get_routing_history_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<RoutingHistoryRow>, StorageError> {
+        self.storage.get_routing_history_for_task(task_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending actions
+    // -----------------------------------------------------------------------
+
+    pub fn list_pending_actions(&self) -> Result<Vec<PendingAction>, StorageError> {
+        self.storage.list_pending_actions()
+    }
+
+    pub fn list_all_actions(&self, limit: usize) -> Result<Vec<PendingAction>, StorageError> {
+        self.storage.list_all_actions(limit)
+    }
+
+    pub fn get_pending_action(
+        &self,
+        id: &ActionId,
+    ) -> Result<Option<PendingAction>, StorageError> {
+        self.storage.get_pending_action(id)
+    }
+
+    pub fn approve_action(&self, id: &ActionId) -> Result<(), StorageError> {
+        let action = self
+            .storage
+            .get_pending_action(id)?
+            .ok_or_else(|| StorageError::NotFound(format!("action {}", id.0)))?;
+
+        self.storage.update_action_status(id, ActionStatus::Approved)?;
+
+        let event = Event::new(
+            EventType::ActionApproved,
+            serde_json::json!({
+                "action_type": format!("{:?}", action.action_type),
+                "description": action.description,
+            }),
+        )
+        .with_project(action.project_id.clone());
+        let _ = self.storage.insert_event(&event);
+
+        info!(action_id = %id.0, "action approved");
+        Ok(())
+    }
+
+    pub fn dismiss_action(&self, id: &ActionId) -> Result<(), StorageError> {
+        let action = self
+            .storage
+            .get_pending_action(id)?
+            .ok_or_else(|| StorageError::NotFound(format!("action {}", id.0)))?;
+
+        self.storage.update_action_status(id, ActionStatus::Rejected)?;
+
+        let event = Event::new(
+            EventType::ActionDismissed,
+            serde_json::json!({
+                "action_type": format!("{:?}", action.action_type),
+                "description": action.description,
+            }),
+        )
+        .with_project(action.project_id.clone());
+        let _ = self.storage.insert_event(&event);
+
+        info!(action_id = %id.0, "action dismissed");
+        Ok(())
+    }
+
+    pub fn create_action(&self, action: &PendingAction) -> Result<(), StorageError> {
+        self.storage.insert_pending_action(action)?;
+
+        let event = Event::new(
+            EventType::ActionCreated,
+            serde_json::json!({
+                "action_type": format!("{:?}", action.action_type),
+                "description": action.description,
+            }),
+        )
+        .with_project(action.project_id.clone());
+        if let Some(ref task_id) = action.task_id {
+            let event = event.with_task(task_id.clone());
+            let _ = self.storage.insert_event(&event);
+        } else {
+            let _ = self.storage.insert_event(&event);
+        }
+
+        info!(action_id = %action.id.0, "action created");
+        Ok(())
+    }
+
+    pub fn list_actions_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<PendingAction>, StorageError> {
+        self.storage.list_actions_for_task(task_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Status overview
+    // -----------------------------------------------------------------------
+
+    pub fn project_status_summary(&self) -> Result<Vec<ProjectStatusEntry>, StorageError> {
+        let projects = self.storage.list_projects()?;
+        let year_month = chrono::Utc::now().format("%Y-%m").to_string();
+
+        let mut entries = Vec::new();
+        for project in projects {
+            let task_counts = self.storage.count_tasks_by_status(&project.id)?;
+            let pending_actions = self.storage.count_pending_actions_for_project(&project.id)?;
+            let spend = self.storage.project_spend_month(&project.id, &year_month)?;
+
+            entries.push(ProjectStatusEntry {
+                name: project.name,
+                task_counts,
+                pending_actions,
+                month_spend: spend,
+            });
+        }
+        Ok(entries)
     }
 }
 

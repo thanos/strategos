@@ -5,6 +5,7 @@ use strategos::adapters::fake::{FakeAdapter, FakeBehavior};
 use strategos::adapters::traits::AdapterRegistry;
 use strategos::budget::governor::*;
 use strategos::models::*;
+use strategos::models::policy::{ActionStatus, PendingAction, PendingActionType};
 use strategos::models::project::Project;
 use strategos::models::task::Task;
 use strategos::orchestrator::service::Orchestrator;
@@ -168,4 +169,191 @@ async fn orchestrator_task_with_skeleton_adapter() {
     assert_eq!(result.execution_output.as_deref(), Some("deep analysis complete"));
     assert!(result.usage.is_some());
     assert_eq!(result.usage.unwrap().cost, MoneyAmount::from_cents(500));
+}
+
+// -----------------------------------------------------------------------
+// Phase 4: Pending action lifecycle tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_create_and_list_actions() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let action = PendingAction::new(
+        PendingActionType::ReviewRequest,
+        project.id.clone(),
+        "review auth module",
+    );
+    orchestrator.create_action(&action).unwrap();
+
+    let pending = orchestrator.list_pending_actions().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].description, "review auth module");
+    assert_eq!(pending[0].status, ActionStatus::Pending);
+}
+
+#[tokio::test]
+async fn orchestrator_approve_action() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let action = PendingAction::new(
+        PendingActionType::CommitSuggestion,
+        project.id.clone(),
+        "suggested commit message",
+    )
+    .with_payload(serde_json::json!({"commit_message": "fix: resolve null pointer"}));
+
+    orchestrator.create_action(&action).unwrap();
+    orchestrator.approve_action(&action.id).unwrap();
+
+    // Should no longer appear in pending list
+    let pending = orchestrator.list_pending_actions().unwrap();
+    assert!(pending.is_empty());
+
+    // But should still appear in all actions list
+    let all = orchestrator.list_all_actions(10).unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, ActionStatus::Approved);
+}
+
+#[tokio::test]
+async fn orchestrator_dismiss_action() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let action = PendingAction::new(
+        PendingActionType::BudgetApproval,
+        project.id.clone(),
+        "approve over-budget task",
+    );
+    orchestrator.create_action(&action).unwrap();
+    orchestrator.dismiss_action(&action.id).unwrap();
+
+    let pending = orchestrator.list_pending_actions().unwrap();
+    assert!(pending.is_empty());
+
+    let all = orchestrator.list_all_actions(10).unwrap();
+    assert_eq!(all[0].status, ActionStatus::Rejected);
+}
+
+#[tokio::test]
+async fn orchestrator_action_emits_events() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let action = PendingAction::new(
+        PendingActionType::ReviewRequest,
+        project.id.clone(),
+        "review changes",
+    );
+    orchestrator.create_action(&action).unwrap();
+    orchestrator.approve_action(&action.id).unwrap();
+
+    let events = orchestrator.recent_events(20).unwrap();
+    let event_types: Vec<_> = events.iter().map(|e| e.event_type).collect();
+
+    use strategos::models::event::EventType;
+    assert!(event_types.contains(&EventType::ActionCreated));
+    assert!(event_types.contains(&EventType::ActionApproved));
+}
+
+#[tokio::test]
+async fn orchestrator_get_action_by_id() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let action = PendingAction::new(
+        PendingActionType::CommitSuggestion,
+        project.id.clone(),
+        "commit suggestion",
+    )
+    .with_payload(serde_json::json!({"message": "feat: add auth"}));
+
+    orchestrator.create_action(&action).unwrap();
+
+    let fetched = orchestrator.get_pending_action(&action.id).unwrap().unwrap();
+    assert_eq!(fetched.description, "commit suggestion");
+    assert_eq!(fetched.payload["message"], "feat: add auth");
+}
+
+// -----------------------------------------------------------------------
+// Phase 4: Status overview tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_project_status_summary() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    // Submit a task so we have counts
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+    orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Create a pending action
+    let action = PendingAction::new(
+        PendingActionType::ReviewRequest,
+        project.id.clone(),
+        "review",
+    );
+    orchestrator.create_action(&action).unwrap();
+
+    let entries = orchestrator.project_status_summary().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "test-project");
+    assert_eq!(entries[0].pending_actions, 1);
+    // Should have at least one task
+    let total_tasks: usize = entries[0].task_counts.iter().map(|(_, c)| c).sum();
+    assert!(total_tasks >= 1);
+}
+
+// -----------------------------------------------------------------------
+// Phase 4: Task detail and actions-for-task tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_task_detail_and_routing_history() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+    let task_id = task.id.clone();
+
+    orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Get task detail
+    let fetched = orchestrator.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(fetched.description, "summarize");
+
+    // Get routing history
+    let routing = orchestrator.get_routing_history_for_task(&task_id).unwrap();
+    assert!(routing.is_some());
+    let routing = routing.unwrap();
+    assert!(!routing.selected_backend.is_empty());
+}
+
+#[tokio::test]
+async fn orchestrator_actions_linked_to_task() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Review, "review code");
+    let task_id = task.id.clone();
+
+    orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Create an action linked to this task
+    let action = PendingAction::new(
+        PendingActionType::ReviewRequest,
+        project.id.clone(),
+        "review findings",
+    )
+    .with_task(task_id.clone());
+    orchestrator.create_action(&action).unwrap();
+
+    let actions = orchestrator.list_actions_for_task(&task_id).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].description, "review findings");
 }

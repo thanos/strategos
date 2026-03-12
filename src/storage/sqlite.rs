@@ -548,6 +548,37 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn get_pending_action(&self, id: &ActionId) -> Result<Option<PendingAction>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action_type, project_id, task_id, description, payload, status, created_at
+                 FROM pending_actions WHERE id = ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![id.0.to_string()], |row| {
+                Ok(PendingActionRow {
+                    id: row.get(0)?,
+                    action_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    description: row.get(4)?,
+                    payload: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        match result {
+            Some(row) => Ok(Some(row.into_pending_action()?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_pending_actions(&self) -> Result<Vec<PendingAction>, StorageError> {
         let mut stmt = self
             .conn
@@ -559,6 +590,38 @@ impl SqliteStorage {
 
         let rows = stmt
             .query_map([], |row| {
+                Ok(PendingActionRow {
+                    id: row.get(0)?,
+                    action_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    description: row.get(4)?,
+                    payload: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut actions = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            actions.push(row.into_pending_action()?);
+        }
+        Ok(actions)
+    }
+
+    pub fn list_all_actions(&self, limit: usize) -> Result<Vec<PendingAction>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action_type, project_id, task_id, description, payload, status, created_at
+                 FROM pending_actions ORDER BY created_at DESC LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
                 Ok(PendingActionRow {
                     id: row.get(0)?,
                     action_type: row.get(1)?,
@@ -630,6 +693,115 @@ impl SqliteStorage {
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn get_routing_history_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<RoutingHistoryRow>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, task_id, selected_backend, reason, fallback_applied, budget_downgrade_applied, decided_at
+                 FROM routing_history WHERE task_id = ?1 ORDER BY decided_at DESC LIMIT 1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![task_id.0.to_string()], |row| {
+                Ok(RoutingHistoryRow {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    selected_backend: row.get(2)?,
+                    reason: row.get(3)?,
+                    fallback_applied: row.get::<_, i32>(4)? != 0,
+                    budget_downgrade_applied: row.get::<_, i32>(5)? != 0,
+                    decided_at: row.get(6)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
+    pub fn list_actions_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<PendingAction>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, action_type, project_id, task_id, description, payload, status, created_at
+                 FROM pending_actions WHERE task_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![task_id.0.to_string()], |row| {
+                Ok(PendingActionRow {
+                    id: row.get(0)?,
+                    action_type: row.get(1)?,
+                    project_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    description: row.get(4)?,
+                    payload: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut actions = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            actions.push(row.into_pending_action()?);
+        }
+        Ok(actions)
+    }
+
+    /// Count tasks by status for a project.
+    pub fn count_tasks_by_status(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<(TaskStatus, usize)>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT status, COUNT(*) FROM tasks WHERE project_id = ?1 GROUP BY status",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![project_id.0.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut counts = Vec::new();
+        for row in rows {
+            let (status_str, count) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            let status: TaskStatus = serde_json::from_str(&status_str)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            counts.push((status, count as usize));
+        }
+        Ok(counts)
+    }
+
+    /// Count pending actions for a project.
+    pub fn count_pending_actions_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<usize, StorageError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_actions WHERE project_id = ?1 AND status = '\"Pending\"'",
+                params![project_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as usize)
     }
 }
 
@@ -784,6 +956,16 @@ impl UsageStore for ThreadSafeStorage {
 // ---------------------------------------------------------------------------
 // Row mapping helpers
 // ---------------------------------------------------------------------------
+
+pub struct RoutingHistoryRow {
+    pub id: String,
+    pub task_id: String,
+    pub selected_backend: String,
+    pub reason: String,
+    pub fallback_applied: bool,
+    pub budget_downgrade_applied: bool,
+    pub decided_at: String,
+}
 
 struct ProjectRow {
     id: String,
@@ -1150,5 +1332,135 @@ mod tests {
         let ym = ThreadSafeStorage::current_year_month();
         let total = storage.total_spend_month(&ym).unwrap();
         assert_eq!(total, MoneyAmount::ZERO);
+    }
+
+    #[test]
+    fn get_pending_action_by_id() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let action = PendingAction::new(
+            PendingActionType::ReviewRequest,
+            project.id.clone(),
+            "review code",
+        );
+        storage.insert_pending_action(&action).unwrap();
+
+        let fetched = storage.get_pending_action(&action.id).unwrap().unwrap();
+        assert_eq!(fetched.description, "review code");
+        assert_eq!(fetched.action_type, PendingActionType::ReviewRequest);
+
+        // Non-existent ID returns None
+        assert!(storage.get_pending_action(&ActionId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_all_actions_includes_all_statuses() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let a1 = PendingAction::new(PendingActionType::ReviewRequest, project.id.clone(), "a1");
+        let a2 = PendingAction::new(PendingActionType::CommitSuggestion, project.id.clone(), "a2");
+        storage.insert_pending_action(&a1).unwrap();
+        storage.insert_pending_action(&a2).unwrap();
+
+        storage.update_action_status(&a1.id, ActionStatus::Approved).unwrap();
+
+        // list_pending_actions only returns pending
+        let pending = storage.list_pending_actions().unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // list_all_actions returns all
+        let all = storage.list_all_actions(10).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn routing_history_for_task() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let task = Task::new(project.id.clone(), TaskType::Planning, "test");
+        storage.insert_task(&task).unwrap();
+
+        // No history yet
+        assert!(storage.get_routing_history_for_task(&task.id).unwrap().is_none());
+
+        storage
+            .insert_routing_history(&task.id, "claude", "TaskTypeDefault", false, true)
+            .unwrap();
+
+        let history = storage.get_routing_history_for_task(&task.id).unwrap().unwrap();
+        assert_eq!(history.selected_backend, "claude");
+        assert_eq!(history.reason, "TaskTypeDefault");
+        assert!(!history.fallback_applied);
+        assert!(history.budget_downgrade_applied);
+    }
+
+    #[test]
+    fn actions_linked_to_task() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let task = Task::new(project.id.clone(), TaskType::Review, "review");
+        storage.insert_task(&task).unwrap();
+
+        let action = PendingAction::new(
+            PendingActionType::ReviewRequest,
+            project.id.clone(),
+            "review findings",
+        )
+        .with_task(task.id.clone());
+        storage.insert_pending_action(&action).unwrap();
+
+        // Unlinked action
+        let other = PendingAction::new(
+            PendingActionType::BudgetApproval,
+            project.id.clone(),
+            "budget approval",
+        );
+        storage.insert_pending_action(&other).unwrap();
+
+        let task_actions = storage.list_actions_for_task(&task.id).unwrap();
+        assert_eq!(task_actions.len(), 1);
+        assert_eq!(task_actions[0].description, "review findings");
+    }
+
+    #[test]
+    fn count_tasks_and_pending_actions() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let project = Project::new("p", "/tmp/p");
+        storage.insert_project(&project).unwrap();
+
+        let t1 = Task::new(project.id.clone(), TaskType::Planning, "plan");
+        let t2 = Task::new(project.id.clone(), TaskType::Review, "review");
+        storage.insert_task(&t1).unwrap();
+        storage.insert_task(&t2).unwrap();
+
+        // Both tasks are Pending by default
+        let counts = storage.count_tasks_by_status(&project.id).unwrap();
+        let pending_count = counts.iter().find(|(s, _)| *s == TaskStatus::Pending).map(|(_, c)| *c).unwrap_or(0);
+        assert_eq!(pending_count, 2);
+
+        // Update one
+        storage.update_task_status(&t1.id, TaskStatus::Completed).unwrap();
+        let counts = storage.count_tasks_by_status(&project.id).unwrap();
+        let completed = counts.iter().find(|(s, _)| *s == TaskStatus::Completed).map(|(_, c)| *c).unwrap_or(0);
+        assert_eq!(completed, 1);
+
+        // Pending actions count
+        let action = PendingAction::new(PendingActionType::ReviewRequest, project.id.clone(), "r");
+        storage.insert_pending_action(&action).unwrap();
+
+        let count = storage.count_pending_actions_for_project(&project.id).unwrap();
+        assert_eq!(count, 1);
+
+        storage.update_action_status(&action.id, ActionStatus::Approved).unwrap();
+        let count = storage.count_pending_actions_for_project(&project.id).unwrap();
+        assert_eq!(count, 0);
     }
 }
