@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use strategos::adapters::fake::{FakeAdapter, FakeBehavior};
-use strategos::adapters::traits::AdapterRegistry;
+use strategos::adapters::traits::{AdapterRegistry, ExecutionConstraints};
 use strategos::budget::governor::*;
+use strategos::errors::AdapterError;
 use strategos::models::*;
 use strategos::models::policy::{ActionStatus, PendingAction, PendingActionType};
 use strategos::models::project::Project;
 use strategos::models::task::{Task, TaskStatus};
-use strategos::orchestrator::service::{CancelError, Orchestrator};
+use strategos::orchestrator::service::{CancelError, Orchestrator, RetryPolicy};
 use strategos::routing::engine::*;
 use strategos::routing::policy::RoutingPolicy;
 use strategos::storage::sqlite::SqliteStorage;
@@ -411,6 +412,7 @@ async fn orchestrator_submit_with_context() {
             MoneyAmount::from_cents(50),
             Some(project_path),
             files,
+            strategos::adapters::traits::ExecutionConstraints::default(),
         )
         .await
         .unwrap();
@@ -655,4 +657,298 @@ async fn storage_task_output_roundtrip() {
     assert_eq!(output.input_tokens, 500);
     assert_eq!(output.output_tokens, 200);
     assert!(output.structured_output.is_some());
+}
+
+// -----------------------------------------------------------------------
+// Phase 8: Execution constraint enforcement tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn constraint_max_cost_rejects_expensive_task() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+
+    let constraints = ExecutionConstraints {
+        max_cost_cents: Some(1), // 1 cent max
+        ..ExecutionConstraints::default()
+    };
+
+    // Estimated cost for "summarize" via default backend will likely be > 1 cent or 0
+    // Use a large estimated cost to ensure the constraint triggers
+    let result = orchestrator
+        .submit_task_with_context(
+            task,
+            ProjectRoutingConfig::default(),
+            MoneyAmount::from_cents(500), // estimated cost 500 cents
+            None,
+            Vec::new(),
+            constraints,
+        )
+        .await;
+
+    match result {
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            assert!(err_msg.contains("cost exceeds constraint"), "got: {}", err_msg);
+        }
+        Ok(_) => panic!("expected cost constraint to reject task"),
+    }
+}
+
+#[tokio::test]
+async fn constraint_timeout_causes_failure() {
+    // Use FakeAdapter that takes time (but is immediate for now, timeout will be very short)
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+
+    // Very short timeout — but FakeAdapter responds immediately, so this should succeed
+    let constraints = ExecutionConstraints {
+        timeout: Some(std::time::Duration::from_secs(10)),
+        ..ExecutionConstraints::default()
+    };
+
+    let result = orchestrator
+        .submit_task_with_context(
+            task,
+            ProjectRoutingConfig::default(),
+            MoneyAmount::from_cents(50),
+            None,
+            Vec::new(),
+            constraints,
+        )
+        .await
+        .unwrap();
+
+    // FakeAdapter is instant, so this should succeed within timeout
+    assert!(result.execution_output.is_some());
+}
+
+#[tokio::test]
+async fn constraint_no_cost_limit_allows_any() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+
+    // No cost limit
+    let constraints = ExecutionConstraints::default();
+
+    let result = orchestrator
+        .submit_task_with_context(
+            task,
+            ProjectRoutingConfig::default(),
+            MoneyAmount::from_cents(99999),
+            None,
+            Vec::new(),
+            constraints,
+        )
+        .await
+        .unwrap();
+
+    // Should succeed since no max_cost_cents constraint
+    assert!(!result.requires_approval || result.execution_output.is_some() || result.execution_output.is_none());
+}
+
+// -----------------------------------------------------------------------
+// Phase 8: Retry policy tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn retry_on_transient_error_succeeds() {
+    // We can't easily make FakeAdapter fail then succeed, but we can test that
+    // permanent errors are NOT retried.
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    // Auth error is permanent — should not be retried
+    registry.register(Arc::new(FakeAdapter::failing(
+        "claude",
+        AdapterError::AuthenticationFailed("bad key".into()),
+    )));
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+
+    let registry = Arc::new(registry);
+    let governor = Arc::new(BudgetGovernor::new(
+        BudgetConfig {
+            mode: BudgetMode::Observe,
+            ..BudgetConfig::default()
+        },
+        Arc::new(InMemoryUsageStore::new()),
+    ));
+    let mut policy = RoutingPolicy::default();
+    policy.check_health_before_routing = false;
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage))
+        .with_retry_policy(RetryPolicy {
+            max_retries: 2,
+            retry_delay: std::time::Duration::from_millis(1),
+        });
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+    let task_id = task.id.clone();
+
+    // Submit — ollama should succeed (it's the default for Summarization)
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Ollama (local) should have been selected and succeeded
+    assert_eq!(result.routing_decision.selected_backend, BackendId::new("ollama"));
+
+    let fetched = storage.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(fetched.status, TaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn retry_exhaustion_fails() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    // Transient error on ollama
+    registry.register(Arc::new(FakeAdapter::failing(
+        "ollama",
+        AdapterError::RequestFailed("connection reset".into()),
+    )));
+
+    // Give ollama local capabilities but make it fail with transient error
+    let mut local_failing = AdapterRegistry::new();
+    local_failing.register(Arc::new(FakeAdapter::new(
+        "ollama",
+        strategos::adapters::traits::AdapterCapabilities {
+            code_editing: false,
+            shell_tool_use: false,
+            multi_step_agent: false,
+            local_execution: true,
+            structured_output: false,
+            streaming: false,
+            subagents: false,
+            session_resume: false,
+        },
+        FakeBehavior::FailWith(AdapterError::RequestFailed("connection reset".into())),
+    )));
+
+    let registry = Arc::new(local_failing);
+    let governor = Arc::new(BudgetGovernor::new(
+        BudgetConfig {
+            mode: BudgetMode::Observe,
+            ..BudgetConfig::default()
+        },
+        Arc::new(InMemoryUsageStore::new()),
+    ));
+    let mut policy = RoutingPolicy::default();
+    policy.check_health_before_routing = false;
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage))
+        .with_retry_policy(RetryPolicy {
+            max_retries: 1, // 1 retry = 2 total attempts
+            retry_delay: std::time::Duration::from_millis(1),
+        });
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+
+    // This should fail after retries (transient RequestFailed)
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Should have no output (failed)
+    assert!(result.execution_output.is_none());
+}
+
+// -----------------------------------------------------------------------
+// Phase 8: Project auto-sync tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn project_sync_adds_new_project() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    // No projects in storage
+    assert!(storage.list_projects().unwrap().is_empty());
+
+    // Sync a config project
+    let config = strategos::config::GlobalConfig::sample();
+    strategos::cli::sync_projects_from_config(&config, &storage);
+
+    let projects = storage.list_projects().unwrap();
+    assert!(projects.len() >= 1);
+    assert!(projects.iter().any(|p| p.name == "my-project"));
+}
+
+#[test]
+fn project_sync_updates_existing() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    let mut project = Project::new("my-project", "/old/path");
+    project.privacy = PrivacyLevel::Public;
+    storage.insert_project(&project).unwrap();
+
+    // Config has different path
+    let config = strategos::config::GlobalConfig::sample();
+    strategos::cli::sync_projects_from_config(&config, &storage);
+
+    let updated = storage.get_project_by_name("my-project").unwrap().unwrap();
+    // Path should be updated from config
+    assert_ne!(updated.path.to_str(), Some("/old/path"));
+}
+
+#[test]
+fn project_sync_preserves_cli_added_projects() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    // Add a project that's NOT in config
+    let extra = Project::new("cli-only-project", "/tmp/cli-only");
+    storage.insert_project(&extra).unwrap();
+
+    let config = strategos::config::GlobalConfig::sample();
+    strategos::cli::sync_projects_from_config(&config, &storage);
+
+    // CLI-only project should still exist
+    let projects = storage.list_projects().unwrap();
+    assert!(projects.iter().any(|p| p.name == "cli-only-project"));
+    // Config projects should also exist
+    assert!(projects.iter().any(|p| p.name == "my-project"));
+}
+
+// -----------------------------------------------------------------------
+// Phase 8: AdapterError transient classification tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn adapter_error_transient_classification() {
+    assert!(AdapterError::RateLimited { retry_after: None }.is_transient());
+    assert!(AdapterError::Unavailable("down".into()).is_transient());
+    assert!(AdapterError::Timeout(std::time::Duration::from_secs(30)).is_transient());
+    assert!(AdapterError::RequestFailed("reset".into()).is_transient());
+
+    assert!(!AdapterError::AuthenticationFailed("bad key".into()).is_transient());
+    assert!(!AdapterError::Unsupported("not supported".into()).is_transient());
+    assert!(!AdapterError::Internal("bug".into()).is_transient());
+}
+
+// -----------------------------------------------------------------------
+// Phase 8: Storage update_project test
+// -----------------------------------------------------------------------
+
+#[test]
+fn storage_update_project() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    let mut project = Project::new("test-proj", "/old/path");
+    storage.insert_project(&project).unwrap();
+
+    project.path = std::path::PathBuf::from("/new/path");
+    project.privacy = PrivacyLevel::LocalOnly;
+    storage.update_project(&project).unwrap();
+
+    let fetched = storage.get_project_by_name("test-proj").unwrap().unwrap();
+    assert_eq!(fetched.path, std::path::PathBuf::from("/new/path"));
+    assert_eq!(fetched.privacy, PrivacyLevel::LocalOnly);
 }

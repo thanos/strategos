@@ -62,6 +62,25 @@ pub enum AdapterError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("cost exceeds constraint: estimated {estimated_cents} cents, max {max_cents} cents")]
+    CostExceedsConstraint {
+        estimated_cents: i64,
+        max_cents: i64,
+    },
+}
+
+impl AdapterError {
+    /// Returns true if this error is transient and the operation may succeed on retry.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            AdapterError::RateLimited { .. }
+                | AdapterError::Unavailable(_)
+                | AdapterError::Timeout(_)
+                | AdapterError::RequestFailed(_)
+        )
+    }
 }
 
 #[derive(Debug, Error)]

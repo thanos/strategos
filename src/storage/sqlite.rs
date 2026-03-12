@@ -138,6 +138,28 @@ impl SqliteStorage {
         Ok(())
     }
 
+    pub fn update_project(&self, project: &Project) -> Result<(), StorageError> {
+        let tags_json = serde_json::to_string(&project.tags)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let privacy_str = serde_json::to_string(&project.privacy)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        self.conn
+            .execute(
+                "UPDATE projects SET name = ?1, path = ?2, privacy = ?3, tags = ?4, updated_at = ?5 WHERE id = ?6",
+                params![
+                    project.name,
+                    project.path.to_string_lossy().to_string(),
+                    privacy_str,
+                    tags_json,
+                    chrono::Utc::now().to_rfc3339(),
+                    project.id.0.to_string(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StorageError> {
         let mut stmt = self
             .conn

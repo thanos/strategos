@@ -55,6 +55,15 @@ pub enum Commands {
         /// Override backend selection
         #[arg(long)]
         backend: Option<String>,
+        /// Maximum output tokens
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Maximum cost in cents
+        #[arg(long)]
+        max_cost: Option<i64>,
     },
 
     /// Show budget status
@@ -130,6 +139,12 @@ pub enum Commands {
         /// Maximum number of records
         #[arg(long, default_value = "50")]
         limit: usize,
+    },
+
+    /// Submit multiple tasks from a TOML batch file
+    Batch {
+        /// Path to batch TOML file
+        file: PathBuf,
     },
 
     /// Show current configuration
@@ -262,8 +277,63 @@ pub fn parse_config() -> Result<(GlobalConfig, ParsedCli)> {
     Ok((config, ParsedCli { config_path, command: cli.command }))
 }
 
+/// Sync projects defined in TOML config to storage.
+/// Adds new projects and updates paths/privacy for existing ones.
+/// Does NOT delete projects that are only in storage (user may have added via CLI).
+pub fn sync_projects_from_config(config: &GlobalConfig, storage: &SqliteStorage) {
+    for pc in &config.projects {
+        match storage.get_project_by_name(&pc.name) {
+            Ok(Some(mut existing)) => {
+                // Update path and privacy if they differ
+                let mut changed = false;
+                if existing.path != pc.path {
+                    existing.path = pc.path.clone();
+                    changed = true;
+                }
+                if let Some(privacy) = pc.privacy {
+                    if existing.privacy != privacy {
+                        existing.privacy = privacy;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = storage.update_project(&existing);
+                    tracing::info!(project = %pc.name, "synced project from config");
+                }
+            }
+            Ok(None) => {
+                // Project not in storage — add it
+                let mut project = crate::models::project::Project::new(&pc.name, &pc.path);
+                if let Some(privacy) = pc.privacy {
+                    project.privacy = privacy;
+                }
+                if let Some(ref tags) = pc.tags {
+                    project.tags = tags.clone();
+                }
+                if let Some(ref backend) = pc.default_backend {
+                    project.default_backend = Some(backend.clone());
+                }
+                if let Some(ref chain) = pc.fallback_chain {
+                    project.fallback_chain = chain.clone();
+                }
+                match storage.insert_project(&project) {
+                    Ok(()) => tracing::info!(project = %pc.name, "added project from config"),
+                    Err(e) => tracing::warn!(project = %pc.name, error = %e, "failed to sync project"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(project = %pc.name, error = %e, "failed to look up project during sync");
+            }
+        }
+    }
+}
+
 /// Run the CLI with pre-loaded config. Called from main after tracing init.
 pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
+    // Auto-sync projects from config to storage on every run
+    if let Ok(storage) = open_storage(&config) {
+        sync_projects_from_config(&config, &storage);
+    }
     match cli.command {
         Commands::Init => cmd_init(&cli.config_path, &config),
         Commands::Project(sub) => cmd_project(sub, &config),
@@ -272,8 +342,11 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             task_type,
             description,
             backend,
+            max_tokens,
+            timeout,
+            max_cost,
         } => {
-            cmd_submit(&config, &project, task_type, &description.join(" "), backend).await
+            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost).await
         }
         Commands::Budget => cmd_budget(&config),
         Commands::Events { limit } => cmd_events(&config, limit),
@@ -297,6 +370,7 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             days,
             limit,
         } => cmd_usage(&config, project.as_deref(), backend.as_deref(), days, limit),
+        Commands::Batch { file } => cmd_batch(&config, &file).await,
         Commands::Config => cmd_config(&config, &cli.config_path),
     }
 }
@@ -363,6 +437,9 @@ async fn cmd_submit(
     task_type: TaskType,
     description: &str,
     backend_override: Option<String>,
+    max_tokens: Option<u64>,
+    timeout_secs: Option<u64>,
+    max_cost_cents: Option<i64>,
 ) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
     let project = storage
@@ -386,6 +463,13 @@ async fn cmd_submit(
         config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
     );
 
+    let constraints = crate::adapters::traits::ExecutionConstraints {
+        max_tokens,
+        max_cost_cents: max_cost_cents,
+        timeout: timeout_secs.map(std::time::Duration::from_secs),
+        ..crate::adapters::traits::ExecutionConstraints::default()
+    };
+
     let result = orchestrator
         .submit_task_with_context(
             task,
@@ -393,6 +477,7 @@ async fn cmd_submit(
             estimated_cost,
             Some(project.path.clone()),
             Vec::new(),
+            constraints,
         )
         .await?;
 
@@ -832,6 +917,7 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                     estimated_cost,
                     Some(project.path.clone()),
                     Vec::new(),
+                    crate::adapters::traits::ExecutionConstraints::default(),
                 )
                 .await?;
 
@@ -991,6 +1077,7 @@ async fn cmd_prepare_commit(
             estimated_cost,
             Some(project.path.clone()),
             Vec::new(),
+            crate::adapters::traits::ExecutionConstraints::default(),
         )
         .await?;
 
@@ -1073,6 +1160,7 @@ async fn cmd_review(
             estimated_cost,
             Some(project.path.clone()),
             context_files,
+            crate::adapters::traits::ExecutionConstraints::default(),
         )
         .await?;
 
@@ -1266,6 +1354,123 @@ fn cmd_usage(
     Ok(())
 }
 
+/// A task entry in a batch TOML file.
+#[derive(Debug, serde::Deserialize)]
+struct BatchTaskEntry {
+    project: String,
+    task_type: String,
+    description: String,
+    backend: Option<String>,
+}
+
+/// Top-level batch file structure.
+#[derive(Debug, serde::Deserialize)]
+struct BatchFile {
+    tasks: Vec<BatchTaskEntry>,
+}
+
+async fn cmd_batch(config: &GlobalConfig, file: &PathBuf) -> Result<()> {
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("cannot read batch file '{}': {}", file.display(), e))?;
+    let batch: BatchFile = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("invalid batch file: {}", e))?;
+
+    if batch.tasks.is_empty() {
+        println!("Batch file contains no tasks.");
+        return Ok(());
+    }
+
+    let storage = Arc::new(open_storage(config)?);
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
+
+    let total = batch.tasks.len();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut total_cost = MoneyAmount::ZERO;
+
+    println!("Submitting {} task(s) from batch file...\n", total);
+
+    for (i, entry) in batch.tasks.iter().enumerate() {
+        let task_type = match parse_task_type(&entry.task_type) {
+            Ok(tt) => tt,
+            Err(e) => {
+                println!("[{}/{}] SKIP: {}", i + 1, total, e);
+                failed += 1;
+                continue;
+            }
+        };
+
+        let project = match storage.get_project_by_name(&entry.project)? {
+            Some(p) => p,
+            None => {
+                println!("[{}/{}] SKIP: project '{}' not found", i + 1, total, entry.project);
+                failed += 1;
+                continue;
+            }
+        };
+
+        let mut task = Task::new(project.id.clone(), task_type, &entry.description);
+        if let Some(ref b) = entry.backend {
+            task.backend_override = Some(BackendId::new(b));
+        }
+
+        let project_config = build_project_routing_config(config, &project);
+        let estimated_cost = estimate_task_cost(
+            &entry.description,
+            &config.default_backend,
+            config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
+        );
+
+        let desc_short = if entry.description.len() > 40 {
+            format!("{}...", &entry.description[..40])
+        } else {
+            entry.description.clone()
+        };
+
+        match orchestrator
+            .submit_task_with_context(
+                task,
+                project_config,
+                estimated_cost,
+                Some(project.path.clone()),
+                Vec::new(),
+                crate::adapters::traits::ExecutionConstraints::default(),
+            )
+            .await
+        {
+            Ok(result) => {
+                let cost = result
+                    .usage
+                    .as_ref()
+                    .map(|u| u.cost)
+                    .unwrap_or(MoneyAmount::ZERO);
+                total_cost = total_cost + cost;
+                println!(
+                    "[{}/{}] OK   {:?} -> {} | {}",
+                    i + 1,
+                    total,
+                    task_type,
+                    result.routing_decision.selected_backend,
+                    desc_short
+                );
+                succeeded += 1;
+            }
+            Err(e) => {
+                println!("[{}/{}] FAIL {:?} | {} — {}", i + 1, total, task_type, desc_short, e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!("\n{}", "=".repeat(50));
+    println!(
+        "Batch complete: {} succeeded, {} failed, total cost: {}",
+        succeeded, failed, total_cost
+    );
+
+    Ok(())
+}
+
 fn cmd_config(config: &GlobalConfig, config_path: &PathBuf) -> Result<()> {
     println!("Config file: {}", config_path.display());
     println!("Storage: {}", config.storage_path().display());
@@ -1356,7 +1561,14 @@ fn build_orchestrator(
         Arc::clone(&registry),
         Arc::clone(&governor),
     );
-    Ok(Orchestrator::new(registry, routing_engine, governor, storage))
+    let mut orchestrator = Orchestrator::new(registry, routing_engine, governor, storage);
+    if let Some(ref retry_cfg) = config.retry_policy {
+        orchestrator.retry_policy = crate::orchestrator::service::RetryPolicy {
+            max_retries: retry_cfg.max_retries,
+            retry_delay: std::time::Duration::from_millis(retry_cfg.retry_delay_ms),
+        };
+    }
+    Ok(orchestrator)
 }
 
 /// Build ProjectRoutingConfig from TOML config and stored project data.

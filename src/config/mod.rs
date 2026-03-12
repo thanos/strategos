@@ -15,8 +15,18 @@ pub struct GlobalConfig {
     pub storage_path: Option<PathBuf>,
     pub log_level: Option<String>,
     pub fallback_chain: Option<Vec<BackendId>>,
+    pub retry_policy: Option<RetryPolicyConfig>,
     pub backends: BackendsConfig,
     pub projects: Vec<ProjectConfig>,
+}
+
+/// Configuration for automatic retry of transient failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicyConfig {
+    /// Maximum number of retry attempts (default: 2).
+    pub max_retries: u32,
+    /// Delay between retries in milliseconds (default: 1000).
+    pub retry_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +247,7 @@ impl GlobalConfig {
             budget_mode: BudgetMode::Govern,
             storage_path: None,
             log_level: Some("info".into()),
+            retry_policy: None,
             fallback_chain: Some(vec![
                 BackendId::new("claude"),
                 BackendId::new("ollama"),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::adapters::traits::{AdapterRegistry, ExecutionContext, ExecutionRequest, ExecutionStatus};
+use crate::adapters::traits::{AdapterRegistry, ExecutionContext, ExecutionRequest, ExecutionConstraints, ExecutionStatus};
 use crate::budget::governor::BudgetGovernor;
 use crate::errors::{AdapterError, RoutingError, StorageError};
 #[allow(unused_imports)]
@@ -17,6 +17,22 @@ use crate::storage::sqlite::RoutingHistoryRow;
 use crate::routing::engine::{ProjectRoutingConfig, RoutingDecision, RoutingEngine, RoutingRequest};
 use crate::storage::sqlite::SqliteStorage;
 
+/// Configuration for automatic retry of transient adapter failures.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub retry_delay: std::time::Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            retry_delay: std::time::Duration::from_millis(1000),
+        }
+    }
+}
+
 /// The orchestrator wires together routing, budget, adapters, and storage.
 /// It manages the full task lifecycle.
 pub struct Orchestrator {
@@ -24,6 +40,7 @@ pub struct Orchestrator {
     pub routing_engine: RoutingEngine,
     pub budget_governor: Arc<BudgetGovernor>,
     pub storage: Arc<SqliteStorage>,
+    pub retry_policy: RetryPolicy,
 }
 
 /// Result of submitting a task through the orchestrator.
@@ -66,7 +83,14 @@ impl Orchestrator {
             routing_engine,
             budget_governor,
             storage,
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Set the retry policy for transient failures.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -109,10 +133,10 @@ impl Orchestrator {
         project_config: ProjectRoutingConfig,
         estimated_cost: MoneyAmount,
     ) -> Result<SubmitResult, SubmitError> {
-        self.submit_task_with_context(task, project_config, estimated_cost, None, Vec::new()).await
+        self.submit_task_with_context(task, project_config, estimated_cost, None, Vec::new(), ExecutionConstraints::default()).await
     }
 
-    /// Submit a task with explicit execution context (project path, files).
+    /// Submit a task with explicit execution context (project path, files) and constraints.
     pub async fn submit_task_with_context(
         &self,
         mut task: Task,
@@ -120,7 +144,17 @@ impl Orchestrator {
         estimated_cost: MoneyAmount,
         project_path: Option<std::path::PathBuf>,
         context_files: Vec<std::path::PathBuf>,
+        constraints: ExecutionConstraints,
     ) -> Result<SubmitResult, SubmitError> {
+        // Enforce max_cost_cents constraint before any work
+        if let Some(max_cents) = constraints.max_cost_cents {
+            if estimated_cost.cents > max_cents {
+                return Err(SubmitError::Adapter(AdapterError::CostExceedsConstraint {
+                    estimated_cents: estimated_cost.cents,
+                    max_cents,
+                }));
+            }
+        }
         // 1. Persist the task
         self.storage
             .insert_task(&task)
@@ -299,7 +333,7 @@ impl Orchestrator {
         task.status = TaskStatus::Routed;
         let _ = self.storage.update_task_status(&task.id, TaskStatus::Routed);
 
-        // 7. Submit to adapter
+        // 7. Submit to adapter (with retry for transient failures)
         let adapter = self
             .registry
             .get(&decision.selected_backend)
@@ -310,49 +344,130 @@ impl Orchestrator {
                 )))
             })?;
 
-        let exec_request = ExecutionRequest {
+        let build_exec_request = || ExecutionRequest {
             task_id: task.id.clone(),
             task_type: task.task_type,
             prompt: task.description.clone(),
             context: ExecutionContext {
-                project_path: project_path.unwrap_or_else(|| std::path::PathBuf::from(".")),
+                project_path: project_path.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
                 working_directory: None,
-                files: context_files,
+                files: context_files.clone(),
                 session_id: None,
                 metadata: std::collections::HashMap::new(),
             },
-            constraints: crate::adapters::traits::ExecutionConstraints::default(),
+            constraints: constraints.clone(),
         };
 
-        let handle = match adapter.submit(exec_request).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "adapter submit failed");
-                let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
-                let fail_event = Event::new(
-                    EventType::TaskFailed,
-                    serde_json::json!({"error": e.to_string()}),
-                )
-                .with_project(task.project_id.clone())
-                .with_task(task.id.clone());
-                let _ = self.storage.insert_event(&fail_event);
+        let max_attempts = 1 + self.retry_policy.max_retries;
+        let mut last_error: Option<AdapterError> = None;
 
-                return Ok(SubmitResult {
-                    task,
-                    routing_decision: decision,
-                    execution_output: None,
-                    usage: None,
-                    requires_approval: false,
-                    pending_action_id: None,
-                });
+        let (handle, status) = 'retry: {
+            for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    info!(task_id = %task.id, attempt, "retrying task after transient failure");
+                    let _ = self.storage.insert_event(
+                        &Event::new(
+                            EventType::TaskSubmitted,
+                            serde_json::json!({"action": "retry", "attempt": attempt}),
+                        )
+                        .with_project(task.project_id.clone())
+                        .with_task(task.id.clone()),
+                    );
+                    tokio::time::sleep(self.retry_policy.retry_delay).await;
+                }
+
+                // Submit
+                let handle = match adapter.submit(build_exec_request()).await {
+                    Ok(h) => h,
+                    Err(e) if e.is_transient() && attempt + 1 < max_attempts => {
+                        warn!(error = %e, attempt, "transient submit failure, will retry");
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "adapter submit failed");
+                        let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                        let fail_event = Event::new(
+                            EventType::TaskFailed,
+                            serde_json::json!({"error": e.to_string()}),
+                        )
+                        .with_project(task.project_id.clone())
+                        .with_task(task.id.clone());
+                        let _ = self.storage.insert_event(&fail_event);
+
+                        return Ok(SubmitResult {
+                            task,
+                            routing_decision: decision,
+                            execution_output: None,
+                            usage: None,
+                            requires_approval: false,
+                            pending_action_id: None,
+                        });
+                    }
+                };
+
+                // 8. Update status to Running
+                let _ = self.storage.update_task_status(&task.id, TaskStatus::Running);
+
+                // 9. Poll for result (with optional timeout)
+                let status = if let Some(timeout_duration) = constraints.timeout {
+                    match tokio::time::timeout(timeout_duration, adapter.poll(&handle)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(task_id = %task.id, timeout = ?timeout_duration, "task timed out");
+                            if attempt + 1 < max_attempts {
+                                last_error = Some(AdapterError::Timeout(timeout_duration));
+                                continue;
+                            }
+                            let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                            let timeout_event = Event::new(
+                                EventType::TaskFailed,
+                                serde_json::json!({"error": format!("timeout after {:?}", timeout_duration)}),
+                            )
+                            .with_project(task.project_id.clone())
+                            .with_task(task.id.clone());
+                            let _ = self.storage.insert_event(&timeout_event);
+                            Ok(ExecutionStatus::Failed(AdapterError::Timeout(timeout_duration)))
+                        }
+                    }
+                } else {
+                    adapter.poll(&handle).await
+                };
+
+                // Check if poll result is a transient failure worth retrying
+                if let Ok(ExecutionStatus::Failed(ref err)) = status {
+                    if err.is_transient() && attempt + 1 < max_attempts {
+                        warn!(error = %err, attempt, "transient poll failure, will retry");
+                        last_error = Some(err.clone());
+                        continue;
+                    }
+                }
+
+                break 'retry (handle, status);
             }
+
+            // All retries exhausted
+            let err = last_error.unwrap_or_else(|| AdapterError::Internal("all retries exhausted".into()));
+            let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+            let fail_event = Event::new(
+                EventType::TaskFailed,
+                serde_json::json!({"error": err.to_string(), "retries_exhausted": true}),
+            )
+            .with_project(task.project_id.clone())
+            .with_task(task.id.clone());
+            let _ = self.storage.insert_event(&fail_event);
+
+            return Ok(SubmitResult {
+                task,
+                routing_decision: decision,
+                execution_output: None,
+                usage: None,
+                requires_approval: false,
+                pending_action_id: None,
+            });
         };
 
-        // 8. Update status to Running
-        let _ = self.storage.update_task_status(&task.id, TaskStatus::Running);
-
-        // 9. Poll for result
-        let status = adapter.poll(&handle).await;
+        let _ = handle; // handle consumed
         let (output, usage_record) = match status {
             Ok(ExecutionStatus::Completed(result)) => {
                 let _ = self
