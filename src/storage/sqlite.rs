@@ -16,7 +16,7 @@ use crate::models::{
     ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
 };
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -91,6 +91,18 @@ impl SqliteStorage {
                 .execute(
                     "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
                     params![2, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 3 {
+            self.conn
+                .execute_batch(SCHEMA_V3)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![3, Utc::now().to_rfc3339()],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
         }
@@ -860,6 +872,178 @@ impl SqliteStorage {
         Ok(counts)
     }
 
+    // -----------------------------------------------------------------------
+    // Task outputs
+    // -----------------------------------------------------------------------
+
+    /// Store execution output for a task.
+    pub fn insert_task_output(
+        &self,
+        task_id: &TaskId,
+        backend_id: &str,
+        output: &str,
+        structured_output: Option<&serde_json::Value>,
+        model: Option<&str>,
+        cost_cents: i64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(), StorageError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let structured = structured_output.map(|v| v.to_string());
+        self.conn
+            .execute(
+                "INSERT INTO task_outputs (id, task_id, backend_id, output, structured_output, model, cost_cents, input_tokens, output_tokens, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    task_id.0.to_string(),
+                    backend_id,
+                    output,
+                    structured,
+                    model,
+                    cost_cents,
+                    input_tokens as i64,
+                    output_tokens as i64,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent output for a task.
+    pub fn get_task_output(&self, task_id: &TaskId) -> Result<Option<TaskOutputRow>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, task_id, backend_id, output, structured_output, model, cost_cents, input_tokens, output_tokens, created_at
+                 FROM task_outputs WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![task_id.0.to_string()], |row| {
+                Ok(TaskOutputRow {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    backend_id: row.get(2)?,
+                    output: row.get(3)?,
+                    structured_output: row.get(4)?,
+                    model: row.get(5)?,
+                    cost_cents: row.get(6)?,
+                    input_tokens: row.get(7)?,
+                    output_tokens: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Spending trends
+    // -----------------------------------------------------------------------
+
+    /// Aggregated spend per month for the last N months.
+    /// Returns Vec<(year_month, total_cents)> ordered newest first.
+    pub fn spend_by_month(&self, n_months: u32) -> Result<Vec<(String, MoneyAmount)>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT SUBSTR(recorded_at, 1, 7) as ym, SUM(cost_cents) as total
+                 FROM usage_records
+                 GROUP BY ym
+                 ORDER BY ym DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![n_months as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (ym, cents) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            result.push((ym, MoneyAmount::from_cents(cents)));
+        }
+        Ok(result)
+    }
+
+    /// Spend per backend per month for the last N months.
+    pub fn spend_by_backend_month(
+        &self,
+        n_months: u32,
+    ) -> Result<Vec<(String, String, MoneyAmount)>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT SUBSTR(recorded_at, 1, 7) as ym, backend_id, SUM(cost_cents) as total
+                 FROM usage_records
+                 GROUP BY ym, backend_id
+                 ORDER BY ym DESC, total DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![(n_months * 10) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (ym, backend, cents) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            result.push((ym, backend, MoneyAmount::from_cents(cents)));
+        }
+        Ok(result)
+    }
+
+    /// Spend per project per month for the last N months.
+    pub fn spend_by_project_month(
+        &self,
+        n_months: u32,
+    ) -> Result<Vec<(String, ProjectId, MoneyAmount)>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT SUBSTR(recorded_at, 1, 7) as ym, project_id, SUM(cost_cents) as total
+                 FROM usage_records
+                 GROUP BY ym, project_id
+                 ORDER BY ym DESC, total DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![(n_months * 10) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (ym, pid_str, cents) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            let pid = uuid::Uuid::parse_str(&pid_str)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            result.push((ym, ProjectId(pid), MoneyAmount::from_cents(cents)));
+        }
+        Ok(result)
+    }
+
     /// Count pending actions for a project.
     pub fn count_pending_actions_for_project(
         &self,
@@ -1037,6 +1221,20 @@ pub struct RoutingHistoryRow {
     pub fallback_applied: bool,
     pub budget_downgrade_applied: bool,
     pub decided_at: String,
+}
+
+/// Task execution output row from the database.
+pub struct TaskOutputRow {
+    pub id: String,
+    pub task_id: String,
+    pub backend_id: String,
+    pub output: String,
+    pub structured_output: Option<String>,
+    pub model: Option<String>,
+    pub cost_cents: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub created_at: String,
 }
 
 struct UsageRecordRow {
@@ -1613,13 +1811,13 @@ mod tests {
     fn schema_v2_migration_creates_indexes() {
         let storage = SqliteStorage::in_memory().unwrap();
 
-        // Verify migration version is 2
+        // Verify migration version is 3 (V1 + V2 indexes + V3 task_outputs)
         let version: i64 = storage.conn.query_row(
             "SELECT MAX(version) FROM _migrations",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         // Verify indexes exist
         let index_count: i64 = storage.conn.query_row(

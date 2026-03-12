@@ -81,3 +81,20 @@ CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_pending_actions_status ON pending_actions(status);
 CREATE INDEX IF NOT EXISTS idx_routing_history_task_id ON routing_history(task_id);
 "#;
+
+/// V3: Add task_outputs table for persistent storage of execution results.
+pub const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS task_outputs (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    backend_id      TEXT NOT NULL,
+    output          TEXT NOT NULL,
+    structured_output TEXT,
+    model           TEXT,
+    cost_cents      INTEGER NOT NULL DEFAULT 0,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_outputs_task_id ON task_outputs(task_id);
+"#;

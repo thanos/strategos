@@ -106,6 +106,13 @@ pub enum Commands {
         backend: Option<String>,
     },
 
+    /// Show spending trends over time
+    Trends {
+        /// Number of months to show
+        #[arg(long, default_value = "3")]
+        months: u32,
+    },
+
     /// Check backend health status
     Health,
 
@@ -182,6 +189,16 @@ pub enum ActionCommands {
 pub enum TaskCommands {
     /// Show detailed task information
     Show {
+        /// Task ID (UUID prefix)
+        id: String,
+    },
+    /// Show task execution output
+    Output {
+        /// Task ID (UUID prefix)
+        id: String,
+    },
+    /// Cancel a pending or running task
+    Cancel {
         /// Task ID (UUID prefix)
         id: String,
     },
@@ -272,6 +289,7 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             files,
             backend,
         } => cmd_review(&config, &project, &files, backend).await,
+        Commands::Trends { months } => cmd_trends(&config, months),
         Commands::Health => cmd_health(&config).await,
         Commands::Usage {
             project,
@@ -714,6 +732,57 @@ async fn cmd_task(sub: TaskCommands, config: &GlobalConfig) -> Result<()> {
                 }
             }
         }
+        TaskCommands::Output { id } => {
+            let task_id = resolve_task_id(&storage, &id)?;
+            let task = storage
+                .get_task(&task_id)?
+                .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+
+            println!("Task: {} ({:?})", task.id.0, task.status);
+
+            match storage.get_task_output(&task_id)? {
+                Some(output_row) => {
+                    println!("Backend: {}", output_row.backend_id);
+                    if let Some(ref model) = output_row.model {
+                        println!("Model:   {}", model);
+                    }
+                    println!(
+                        "Tokens:  {} input / {} output",
+                        output_row.input_tokens, output_row.output_tokens
+                    );
+                    println!(
+                        "Cost:    {}",
+                        MoneyAmount::from_cents(output_row.cost_cents)
+                    );
+                    println!("Created: {}", output_row.created_at);
+                    println!("\n--- Output ---");
+                    println!("{}", output_row.output);
+                    if let Some(ref structured) = output_row.structured_output {
+                        println!("\n--- Structured Output ---");
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(structured) {
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        } else {
+                            println!("{}", structured);
+                        }
+                    }
+                }
+                None => {
+                    println!("No output stored for this task.");
+                }
+            }
+        }
+        TaskCommands::Cancel { id } => {
+            let task_id = resolve_task_id(&storage, &id)?;
+            let orchestrator = build_orchestrator(config, storage)?;
+
+            match orchestrator.cancel_task(&task_id) {
+                Ok(()) => println!("Task {} cancelled.", task_id.0),
+                Err(crate::orchestrator::service::CancelError::InvalidState(msg)) => {
+                    anyhow::bail!("Cannot cancel: {}", msg);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         TaskCommands::Retry { id, backend } => {
             let task_id = resolve_task_id(&storage, &id)?;
             let original = storage
@@ -1028,6 +1097,73 @@ async fn cmd_review(
     if !review_output.is_empty() {
         println!("\n--- Review ---");
         println!("{}", review_output);
+    }
+
+    Ok(())
+}
+
+fn cmd_trends(config: &GlobalConfig, months: u32) -> Result<()> {
+    let storage = open_storage(config)?;
+
+    let monthly = storage.spend_by_month(months)?;
+    let by_backend = storage.spend_by_backend_month(months)?;
+    let by_project = storage.spend_by_project_month(months)?;
+
+    if monthly.is_empty() {
+        println!("No spending data available.");
+        return Ok(());
+    }
+
+    println!("Spending Trends (last {} months)", months);
+    println!("{}", "=".repeat(50));
+
+    // Monthly totals with month-over-month change
+    println!("\n{:<12} {:<15} {}", "MONTH", "SPEND", "CHANGE");
+    println!("{}", "-".repeat(40));
+    let mut prev_cents: Option<i64> = None;
+    // Reverse so oldest is first for change calculation
+    let monthly_ordered: Vec<_> = monthly.iter().rev().collect();
+    for (ym, amount) in &monthly_ordered {
+        let change = match prev_cents {
+            Some(prev) if prev > 0 => {
+                let pct = ((amount.cents - prev) as f64 / prev as f64) * 100.0;
+                if pct > 0.0 {
+                    format!("+{:.0}%", pct)
+                } else {
+                    format!("{:.0}%", pct)
+                }
+            }
+            _ => "—".to_string(),
+        };
+        println!("{:<12} {:<15} {}", ym, amount, change);
+        prev_cents = Some(amount.cents);
+    }
+
+    // By backend
+    if !by_backend.is_empty() {
+        println!("\nBy Backend:");
+        println!("{:<12} {:<15} {}", "MONTH", "BACKEND", "SPEND");
+        println!("{}", "-".repeat(40));
+        for (ym, backend, amount) in &by_backend {
+            println!("{:<12} {:<15} {}", ym, backend, amount);
+        }
+    }
+
+    // By project
+    if !by_project.is_empty() {
+        println!("\nBy Project:");
+        println!("{:<12} {:<38} {}", "MONTH", "PROJECT", "SPEND");
+        println!("{}", "-".repeat(55));
+        // Resolve project names
+        for (ym, project_id, amount) in &by_project {
+            let name = storage
+                .get_project(project_id)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| project_id.0.to_string());
+            println!("{:<12} {:<38} {}", ym, name, amount);
+        }
     }
 
     Ok(())

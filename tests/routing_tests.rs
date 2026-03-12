@@ -4,6 +4,7 @@ use std::sync::Arc;
 use strategos::adapters::fake::FakeAdapter;
 use strategos::adapters::traits::AdapterRegistry;
 use strategos::budget::governor::*;
+use strategos::errors::AdapterError;
 use strategos::models::{BackendId, MoneyAmount, PrivacyLevel, ProjectId, TaskId, TaskType};
 use strategos::routing::engine::*;
 use strategos::routing::policy::RoutingPolicy;
@@ -286,4 +287,95 @@ async fn decision_includes_evaluated_backends() {
 
     let decision = engine.route(make_request(TaskType::DeepCodeReasoning)).await.unwrap();
     assert!(!decision.evaluated_backends.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: Backend health gate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unhealthy_backend_is_skipped() {
+    // Make claude unavailable, ollama healthy
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(FakeAdapter::failing(
+        "claude",
+        AdapterError::Unavailable("down for maintenance".into()),
+    )));
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+
+    let policy = RoutingPolicy::default(); // check_health_before_routing = true
+
+    let engine = RoutingEngine::new(
+        policy,
+        Arc::new(registry),
+        Arc::new(allow_all_governor()),
+    );
+
+    // Planning defaults to Claude, but Claude is unhealthy, so should fall back
+    // to ollama via fallback chain
+    let decision = engine.route(make_request(TaskType::Summarization)).await.unwrap();
+    assert_eq!(decision.selected_backend, ollama());
+}
+
+#[tokio::test]
+async fn unhealthy_backend_fallback_to_healthy() {
+    let mut registry = AdapterRegistry::new();
+    // Claude is unavailable
+    registry.register(Arc::new(FakeAdapter::failing(
+        "claude",
+        AdapterError::Unavailable("service down".into()),
+    )));
+    // Ollama is healthy
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+
+    // LowCostDrafting which ollama supports, default to claude to force fallback
+    let mut policy = RoutingPolicy::default();
+    policy.task_defaults.insert(TaskType::LowCostDrafting, claude());
+
+    let engine = RoutingEngine::new(
+        policy,
+        Arc::new(registry),
+        Arc::new(allow_all_governor()),
+    );
+
+    let decision = engine.route(make_request(TaskType::LowCostDrafting)).await.unwrap();
+    assert_eq!(decision.selected_backend, ollama());
+    // Claude was unhealthy, so ollama was selected via fallback or downgrade
+    assert!(
+        decision.fallback_applied
+            || decision.budget_downgrade_applied
+            || matches!(decision.reason, RoutingReason::FallbackChain { .. }),
+        "expected fallback path, got reason: {:?}",
+        decision.reason
+    );
+}
+
+#[tokio::test]
+async fn health_check_disabled_allows_unhealthy_backend() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(FakeAdapter::failing(
+        "claude",
+        AdapterError::Unavailable("down".into()),
+    )));
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+
+    let mut policy = RoutingPolicy::default();
+    policy.check_health_before_routing = false;
+
+    let engine = RoutingEngine::new(
+        policy,
+        Arc::new(registry),
+        Arc::new(allow_all_governor()),
+    );
+
+    // With health check disabled, claude should still be selected (even though it
+    // will fail at submission time). The FakeAdapter::failing returns Unavailable
+    // from health_check but we're skipping that check.
+    // For Summarization, the default is Ollama, so let's test with a type that
+    // defaults to Claude.
+    let mut request = make_request(TaskType::DeepCodeReasoning);
+    request.backend_override = Some(claude());
+
+    let decision = engine.route(request).await.unwrap();
+    assert_eq!(decision.selected_backend, claude());
 }

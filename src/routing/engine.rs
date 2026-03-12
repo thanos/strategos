@@ -201,6 +201,20 @@ impl RoutingEngine {
             }
         };
 
+        // Check health (if enabled)
+        if self.policy.check_health_before_routing {
+            let health = adapter.health_check().await;
+            if !health.is_healthy() {
+                tracing::info!(backend = %backend_id, status = %health, "skipping unhealthy backend");
+                evaluations.push(BackendEvaluation {
+                    backend_id: backend_id.clone(),
+                    eligible: false,
+                    rejection_reason: Some(format!("unhealthy: {}", health)),
+                });
+                return Ok(None);
+            }
+        }
+
         // Check privacy constraint
         if request.project_config.privacy == PrivacyLevel::LocalOnly
             && !adapter.capabilities().local_execution

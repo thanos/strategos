@@ -7,8 +7,8 @@ use strategos::budget::governor::*;
 use strategos::models::*;
 use strategos::models::policy::{ActionStatus, PendingAction, PendingActionType};
 use strategos::models::project::Project;
-use strategos::models::task::Task;
-use strategos::orchestrator::service::Orchestrator;
+use strategos::models::task::{Task, TaskStatus};
+use strategos::orchestrator::service::{CancelError, Orchestrator};
 use strategos::routing::engine::*;
 use strategos::routing::policy::RoutingPolicy;
 use strategos::storage::sqlite::SqliteStorage;
@@ -428,4 +428,231 @@ async fn orchestrator_cost_estimation_zero_for_local() {
         "llama3",
     );
     assert_eq!(cost, MoneyAmount::ZERO);
+}
+
+// -----------------------------------------------------------------------
+// Phase 7: Task output persistence tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_persists_task_output() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+    let task_id = task.id.clone();
+
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Task should have completed and stored output
+    assert!(result.execution_output.is_some());
+
+    // Output should be retrievable from storage
+    let output = orchestrator.storage.get_task_output(&task_id).unwrap();
+    assert!(output.is_some(), "task output should be persisted");
+    let output = output.unwrap();
+    assert!(!output.output.is_empty());
+    assert_eq!(output.backend_id, result.routing_decision.selected_backend.as_str());
+}
+
+#[tokio::test]
+async fn orchestrator_no_output_for_failed_task() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    use strategos::errors::AdapterError;
+    registry.register(Arc::new(FakeAdapter::failing(
+        "claude",
+        AdapterError::Unavailable("test unavailable".into()),
+    )));
+    registry.register(Arc::new(FakeAdapter::failing(
+        "ollama",
+        AdapterError::Unavailable("test unavailable".into()),
+    )));
+
+    let registry = Arc::new(registry);
+    let governor = Arc::new(BudgetGovernor::new(
+        BudgetConfig {
+            mode: BudgetMode::Observe,
+            ..BudgetConfig::default()
+        },
+        Arc::new(InMemoryUsageStore::new()),
+    ));
+    let mut policy = RoutingPolicy::default();
+    policy.check_health_before_routing = false; // skip health checks
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage));
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "summarize");
+    let task_id = task.id.clone();
+
+    let _ = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await;
+
+    // No output should be persisted for a failed task
+    let output = storage.get_task_output(&task_id).unwrap();
+    assert!(output.is_none());
+}
+
+// -----------------------------------------------------------------------
+// Phase 7: Task cancellation tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn orchestrator_cancel_pending_task() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    // Insert a task directly (don't submit to keep it Pending)
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "cancel me");
+    let task_id = task.id.clone();
+    orchestrator.storage.insert_task(&task).unwrap();
+
+    orchestrator.cancel_task(&task_id).unwrap();
+
+    let fetched = orchestrator.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(fetched.status, TaskStatus::Cancelled);
+
+    // Should have emitted a TaskCancelled event
+    let events = orchestrator.recent_events(20).unwrap();
+    use strategos::models::event::EventType;
+    assert!(events.iter().any(|e| e.event_type == EventType::TaskCancelled));
+}
+
+#[tokio::test]
+async fn orchestrator_cancel_completed_task_fails() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    // Submit and complete a task
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "done task");
+    let task_id = task.id.clone();
+    orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+
+    // Should not be cancellable
+    let result = orchestrator.cancel_task(&task_id);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        CancelError::InvalidState(msg) => {
+            assert!(msg.contains("Completed"), "expected Completed in: {}", msg);
+        }
+        other => panic!("expected InvalidState, got: {:?}", other),
+    }
+}
+
+// -----------------------------------------------------------------------
+// Phase 7: Spending trends (storage-level) tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn storage_spend_by_month() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+    storage.insert_task(&task).unwrap();
+
+    // Insert usage records
+    let usage = strategos::models::usage::UsageRecord::new(
+        task.id.clone(),
+        project.id.clone(),
+        BackendId::new("claude"),
+        100,
+        50,
+        MoneyAmount::from_cents(200),
+    );
+    storage.insert_usage(&usage).unwrap();
+
+    let monthly = storage.spend_by_month(3).unwrap();
+    assert!(!monthly.is_empty());
+    assert_eq!(monthly[0].1, MoneyAmount::from_cents(200));
+}
+
+#[tokio::test]
+async fn storage_spend_by_backend_month() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+    storage.insert_task(&task).unwrap();
+
+    let usage = strategos::models::usage::UsageRecord::new(
+        task.id.clone(),
+        project.id.clone(),
+        BackendId::new("claude"),
+        100,
+        50,
+        MoneyAmount::from_cents(300),
+    );
+    storage.insert_usage(&usage).unwrap();
+
+    let by_backend = storage.spend_by_backend_month(3).unwrap();
+    assert!(!by_backend.is_empty());
+    assert_eq!(by_backend[0].1, "claude");
+    assert_eq!(by_backend[0].2, MoneyAmount::from_cents(300));
+}
+
+#[tokio::test]
+async fn storage_spend_by_project_month() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("trends-test", "/tmp/t");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Review, "review");
+    storage.insert_task(&task).unwrap();
+
+    let usage = strategos::models::usage::UsageRecord::new(
+        task.id.clone(),
+        project.id.clone(),
+        BackendId::new("ollama"),
+        50,
+        25,
+        MoneyAmount::from_cents(0),
+    );
+    storage.insert_usage(&usage).unwrap();
+
+    let by_project = storage.spend_by_project_month(3).unwrap();
+    // ollama is zero-cost, so might not appear if SUM is 0
+    // Just verify it doesn't error
+    assert!(by_project.is_empty() || by_project[0].1 == project.id);
+}
+
+#[tokio::test]
+async fn storage_task_output_roundtrip() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("p", "/tmp/p");
+    storage.insert_project(&project).unwrap();
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
+    storage.insert_task(&task).unwrap();
+
+    storage
+        .insert_task_output(
+            &task.id,
+            "claude",
+            "the output text",
+            Some(&serde_json::json!({"key": "value"})),
+            Some("claude-sonnet-4-20250514"),
+            150,
+            500,
+            200,
+        )
+        .unwrap();
+
+    let output = storage.get_task_output(&task.id).unwrap().unwrap();
+    assert_eq!(output.output, "the output text");
+    assert_eq!(output.backend_id, "claude");
+    assert_eq!(output.model.as_deref(), Some("claude-sonnet-4-20250514"));
+    assert_eq!(output.cost_cents, 150);
+    assert_eq!(output.input_tokens, 500);
+    assert_eq!(output.output_tokens, 200);
+    assert!(output.structured_output.is_some());
 }

@@ -13,6 +13,8 @@ pub struct RoutingPolicy {
     pub global_fallback_chain: Vec<BackendId>,
     /// When a backend is over budget, downgrade to this backend.
     pub budget_downgrade_map: HashMap<BackendId, BackendId>,
+    /// Whether to check backend health before routing (default: true).
+    pub check_health_before_routing: bool,
 }
 
 impl Default for RoutingPolicy {
@@ -40,6 +42,7 @@ impl Default for RoutingPolicy {
             task_defaults,
             global_fallback_chain: vec![claude, ollama],
             budget_downgrade_map,
+            check_health_before_routing: true,
         }
     }
 }

@@ -369,6 +369,18 @@ impl Orchestrator {
                 );
                 let _ = self.storage.insert_usage(&usage);
 
+                // Persist execution output
+                let _ = self.storage.insert_task_output(
+                    &task.id,
+                    decision.selected_backend.as_str(),
+                    &result.output,
+                    result.structured_output.as_ref(),
+                    result.usage.model.as_deref(),
+                    result.usage.cost.cents,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                );
+
                 let complete_event = Event::new(
                     EventType::TaskCompleted,
                     serde_json::json!({
@@ -464,6 +476,43 @@ impl Orchestrator {
 
     pub fn get_task(&self, id: &TaskId) -> Result<Option<Task>, StorageError> {
         self.storage.get_task(id)
+    }
+
+    /// Cancel a task. Only Pending, Routed, or Running tasks can be cancelled.
+    pub fn cancel_task(&self, id: &TaskId) -> Result<(), CancelError> {
+        let task = self
+            .storage
+            .get_task(id)
+            .map_err(CancelError::Storage)?
+            .ok_or_else(|| CancelError::Storage(StorageError::NotFound(format!("task {}", id.0))))?;
+
+        match task.status {
+            TaskStatus::Pending | TaskStatus::Routed | TaskStatus::Running => {}
+            other => {
+                return Err(CancelError::InvalidState(format!(
+                    "cannot cancel task in {:?} state",
+                    other
+                )));
+            }
+        }
+
+        self.storage
+            .update_task_status(id, TaskStatus::Cancelled)
+            .map_err(CancelError::Storage)?;
+
+        let event = Event::new(
+            EventType::TaskCancelled,
+            serde_json::json!({
+                "task_type": format!("{:?}", task.task_type),
+                "previous_status": format!("{:?}", task.status),
+            }),
+        )
+        .with_project(task.project_id.clone())
+        .with_task(id.clone());
+        let _ = self.storage.insert_event(&event);
+
+        info!(task_id = %id.0, "task cancelled");
+        Ok(())
     }
 
     pub fn get_routing_history_for_task(
@@ -598,4 +647,12 @@ pub enum SubmitError {
     Routing(RoutingError),
     #[error("adapter error: {0}")]
     Adapter(AdapterError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CancelError {
+    #[error("storage error: {0}")]
+    Storage(StorageError),
+    #[error("invalid state: {0}")]
+    InvalidState(String),
 }
