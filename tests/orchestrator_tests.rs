@@ -1786,3 +1786,245 @@ fn global_config_with_webhooks_roundtrips() {
     assert_eq!(webhooks[0].name, "slack");
     assert!(webhooks[0].enabled);
 }
+
+// ==========================================================================
+// Phase 11: Task Tagging, Rate Limiting, Circuit Breaker, Concurrent Limits
+// ==========================================================================
+
+#[test]
+fn task_tags_stored_and_retrieved() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("tag-proj", "/tmp/tags");
+    storage.insert_project(&project).unwrap();
+
+    let mut task = Task::new(project.id.clone(), TaskType::Review, "tagged task");
+    task.tags = vec!["rust".into(), "backend".into()];
+    storage.insert_task(&task).unwrap();
+
+    let retrieved = storage.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(retrieved.tags, vec!["rust", "backend"]);
+}
+
+#[test]
+fn search_tasks_by_tag_finds_matching() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("search-proj", "/tmp/search");
+    storage.insert_project(&project).unwrap();
+
+    let mut t1 = Task::new(project.id.clone(), TaskType::Review, "first task");
+    t1.tags = vec!["rust".into(), "frontend".into()];
+    storage.insert_task(&t1).unwrap();
+
+    let mut t2 = Task::new(project.id.clone(), TaskType::Summarization, "second task");
+    t2.tags = vec!["python".into(), "backend".into()];
+    storage.insert_task(&t2).unwrap();
+
+    let mut t3 = Task::new(project.id.clone(), TaskType::Planning, "third task");
+    t3.tags = vec!["rust".into(), "backend".into()];
+    storage.insert_task(&t3).unwrap();
+
+    let results = storage.search_tasks_by_tag("rust").unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|t| t.id == t1.id));
+    assert!(results.iter().any(|t| t.id == t3.id));
+}
+
+#[test]
+fn search_tasks_by_tag_no_match() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("notag-proj", "/tmp/notag");
+    storage.insert_project(&project).unwrap();
+
+    let mut task = Task::new(project.id.clone(), TaskType::Review, "a task");
+    task.tags = vec!["rust".into()];
+    storage.insert_task(&task).unwrap();
+
+    let results = storage.search_tasks_by_tag("python").unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn rate_limit_record_and_count() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    storage.record_rate_limit_request("claude").unwrap();
+    storage.record_rate_limit_request("claude").unwrap();
+    storage.record_rate_limit_request("ollama").unwrap();
+
+    let claude_count = storage.count_recent_requests("claude", 60).unwrap();
+    let ollama_count = storage.count_recent_requests("ollama", 60).unwrap();
+    assert_eq!(claude_count, 2);
+    assert_eq!(ollama_count, 1);
+}
+
+#[test]
+fn rate_limit_prune_old_entries() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    storage.record_rate_limit_request("claude").unwrap();
+    storage.record_rate_limit_request("claude").unwrap();
+
+    // Prune with a very large window — nothing should be removed
+    let pruned = storage.prune_rate_limit_log(9999).unwrap();
+    assert_eq!(pruned, 0);
+    assert_eq!(storage.count_recent_requests("claude", 60).unwrap(), 2);
+}
+
+#[test]
+fn circuit_breaker_initial_state_is_none() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let state = storage.get_circuit_breaker_state("claude").unwrap();
+    assert!(state.is_none());
+}
+
+#[test]
+fn circuit_breaker_records_failures_and_trips() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    // Record failures up to threshold (3)
+    let s1 = storage.record_backend_failure("claude", 3).unwrap();
+    assert_eq!(s1.consecutive_failures, 1);
+    assert_eq!(s1.state, "Closed");
+
+    let s2 = storage.record_backend_failure("claude", 3).unwrap();
+    assert_eq!(s2.consecutive_failures, 2);
+    assert_eq!(s2.state, "Closed");
+
+    let s3 = storage.record_backend_failure("claude", 3).unwrap();
+    assert_eq!(s3.consecutive_failures, 3);
+    assert_eq!(s3.state, "Open");
+    assert!(s3.tripped_at.is_some());
+}
+
+#[test]
+fn circuit_breaker_success_resets() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    storage.record_backend_failure("claude", 3).unwrap();
+    storage.record_backend_failure("claude", 3).unwrap();
+
+    storage.record_backend_success("claude").unwrap();
+
+    let state = storage.get_circuit_breaker_state("claude").unwrap().unwrap();
+    assert_eq!(state.consecutive_failures, 0);
+    assert_eq!(state.state, "Closed");
+}
+
+#[test]
+fn circuit_breaker_recovery_check() {
+    let storage = SqliteStorage::in_memory().unwrap();
+
+    // Trip the breaker
+    storage.record_backend_failure("claude", 1).unwrap();
+
+    // Recovery with very short cooldown should pass
+    let recovered = storage.check_circuit_breaker_recovery("claude", 0).unwrap();
+    assert!(recovered);
+
+    // Recovery with very long cooldown should not pass
+    let not_recovered = storage.check_circuit_breaker_recovery("claude", 999999).unwrap();
+    assert!(!not_recovered);
+}
+
+#[test]
+fn count_running_tasks_zero_initially() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let count = storage.count_running_tasks().unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn count_running_tasks_for_project_works() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    let project = Project::new("conc-proj", "/tmp/conc");
+    storage.insert_project(&project).unwrap();
+
+    let mut t1 = Task::new(project.id.clone(), TaskType::Review, "task 1");
+    t1.status = TaskStatus::Running;
+    storage.insert_task(&t1).unwrap();
+
+    // Need to update status to Running explicitly since insert uses the task's status
+    storage.update_task_status(&t1.id, TaskStatus::Running).unwrap();
+
+    let count = storage.count_running_tasks_for_project(&project.id).unwrap();
+    assert_eq!(count, 1);
+
+    let global_count = storage.count_running_tasks().unwrap();
+    assert_eq!(global_count, 1);
+}
+
+#[tokio::test]
+async fn concurrency_limit_blocks_submission() {
+    let (mut orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    orchestrator.concurrency = Some(strategos::config::ConcurrencyConfig {
+        max_concurrent_global: 0,  // Block everything
+        max_concurrent_per_backend: None,
+        max_concurrent_per_project: None,
+    });
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "blocked task");
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(10))
+        .await;
+
+    match result {
+        Err(ref e) => assert!(e.to_string().contains("concurrency limit"), "unexpected error: {}", e),
+        Ok(_) => panic!("expected concurrency limit error"),
+    }
+}
+
+#[test]
+fn rate_limit_config_roundtrips() {
+    let mut config = strategos::config::GlobalConfig::sample();
+    config.rate_limits = Some(vec![strategos::config::RateLimitConfig {
+        backend: "claude".into(),
+        max_requests_per_minute: 10,
+    }]);
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    let parsed: strategos::config::GlobalConfig = toml::from_str(&toml_str).unwrap();
+    let rl = parsed.rate_limits.unwrap();
+    assert_eq!(rl.len(), 1);
+    assert_eq!(rl[0].backend, "claude");
+    assert_eq!(rl[0].max_requests_per_minute, 10);
+}
+
+#[test]
+fn concurrency_config_roundtrips() {
+    let mut config = strategos::config::GlobalConfig::sample();
+    config.concurrency = Some(strategos::config::ConcurrencyConfig {
+        max_concurrent_global: 5,
+        max_concurrent_per_backend: Some(3),
+        max_concurrent_per_project: Some(2),
+    });
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    let parsed: strategos::config::GlobalConfig = toml::from_str(&toml_str).unwrap();
+    let conc = parsed.concurrency.unwrap();
+    assert_eq!(conc.max_concurrent_global, 5);
+    assert_eq!(conc.max_concurrent_per_backend, Some(3));
+    assert_eq!(conc.max_concurrent_per_project, Some(2));
+}
+
+#[test]
+fn circuit_breaker_config_roundtrips() {
+    let mut config = strategos::config::GlobalConfig::sample();
+    config.circuit_breaker = Some(strategos::config::CircuitBreakerConfig {
+        failure_threshold: 5,
+        cooldown_secs: 120,
+    });
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    let parsed: strategos::config::GlobalConfig = toml::from_str(&toml_str).unwrap();
+    let cb = parsed.circuit_breaker.unwrap();
+    assert_eq!(cb.failure_threshold, 5);
+    assert_eq!(cb.cooldown_secs, 120);
+}
+
+#[test]
+fn circuit_breaker_config_defaults() {
+    let cb = strategos::config::CircuitBreakerConfig::default();
+    assert_eq!(cb.failure_threshold, 3);
+    assert_eq!(cb.cooldown_secs, 60);
+}

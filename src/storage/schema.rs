@@ -132,3 +132,25 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_at ON webhook_deliveries(delivered_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_name ON webhook_deliveries(webhook_name);
 "#;
+
+/// V7: Add tags column to tasks and rate_limit_log table.
+pub const SCHEMA_V7: &str = r#"
+ALTER TABLE tasks ADD COLUMN tags TEXT;
+CREATE TABLE IF NOT EXISTS rate_limit_log (
+    id          TEXT PRIMARY KEY,
+    backend_id  TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_log_backend ON rate_limit_log(backend_id, recorded_at);
+"#;
+
+/// V8: Add circuit_breaker_state table for tracking backend failures.
+pub const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+    backend_id          TEXT PRIMARY KEY,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_failure_at     TEXT,
+    tripped_at          TEXT,
+    state               TEXT NOT NULL DEFAULT 'Closed'
+);
+"#;

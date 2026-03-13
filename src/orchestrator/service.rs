@@ -72,6 +72,9 @@ pub struct Orchestrator {
     pub storage: Arc<SqliteStorage>,
     pub retry_policy: RetryPolicy,
     pub webhooks: Vec<crate::config::WebhookConfig>,
+    pub rate_limits: Vec<crate::config::RateLimitConfig>,
+    pub concurrency: Option<crate::config::ConcurrencyConfig>,
+    pub circuit_breaker: crate::config::CircuitBreakerConfig,
 }
 
 /// Result of submitting a task through the orchestrator.
@@ -116,6 +119,9 @@ impl Orchestrator {
             storage,
             retry_policy: RetryPolicy::default(),
             webhooks: Vec::new(),
+            rate_limits: Vec::new(),
+            concurrency: None,
+            circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         }
     }
 
@@ -187,6 +193,27 @@ impl Orchestrator {
                 }));
             }
         }
+        // Enforce global concurrency limit
+        if let Some(ref conc) = self.concurrency {
+            let running = self.storage.count_running_tasks().unwrap_or(0);
+            if running >= conc.max_concurrent_global {
+                return Err(SubmitError::ConcurrencyLimit(format!(
+                    "global concurrency limit reached ({}/{})",
+                    running, conc.max_concurrent_global
+                )));
+            }
+            // Per-project limit
+            if let Some(max_proj) = conc.max_concurrent_per_project {
+                let proj_running = self.storage.count_running_tasks_for_project(&task.project_id).unwrap_or(0);
+                if proj_running >= max_proj {
+                    return Err(SubmitError::ConcurrencyLimit(format!(
+                        "per-project concurrency limit reached ({}/{})",
+                        proj_running, max_proj
+                    )));
+                }
+            }
+        }
+
         // 1. Persist the task (skip if already stored, e.g. dequeued tasks)
         match self.storage.insert_task(&task) {
             Ok(()) => {}
@@ -364,6 +391,58 @@ impl Orchestrator {
         .with_project(task.project_id.clone())
         .with_task(task.id.clone());
         let _ = self.storage.insert_event(&routing_event);
+
+        // 6a. Check circuit breaker for selected backend
+        {
+            let backend_str = decision.selected_backend.as_str();
+            let cb_state = self.storage.get_circuit_breaker_state(backend_str)
+                .unwrap_or(None);
+            if let Some(ref state) = cb_state {
+                if state.state == "Open" {
+                    let recovered = self.storage
+                        .check_circuit_breaker_recovery(backend_str, self.circuit_breaker.cooldown_secs)
+                        .unwrap_or(false);
+                    if !recovered {
+                        let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                        return Err(SubmitError::CircuitBreakerOpen(format!(
+                            "backend {} circuit breaker is open ({} consecutive failures)",
+                            backend_str, state.consecutive_failures
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 6b. Enforce per-backend rate limit
+        {
+            let backend_str = decision.selected_backend.as_str();
+            if let Some(rl) = self.rate_limits.iter().find(|r| r.backend == backend_str) {
+                let count = self.storage.count_recent_requests(backend_str, 60).unwrap_or(0);
+                if count >= rl.max_requests_per_minute {
+                    let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                    return Err(SubmitError::RateLimited(format!(
+                        "backend {} rate limit exceeded ({}/{} per minute)",
+                        backend_str, count, rl.max_requests_per_minute
+                    )));
+                }
+                let _ = self.storage.record_rate_limit_request(backend_str);
+            }
+        }
+
+        // 6c. Per-backend concurrency limit
+        if let Some(ref conc) = self.concurrency {
+            if let Some(max_backend) = conc.max_concurrent_per_backend {
+                let backend_str = decision.selected_backend.as_str();
+                let running = self.storage.count_running_tasks_for_backend(backend_str).unwrap_or(0);
+                if running >= max_backend {
+                    let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                    return Err(SubmitError::ConcurrencyLimit(format!(
+                        "per-backend concurrency limit reached for {} ({}/{})",
+                        backend_str, running, max_backend
+                    )));
+                }
+            }
+        }
 
         // 6. Update task status to Routed
         task.status = TaskStatus::Routed;
@@ -543,6 +622,9 @@ impl Orchestrator {
                 .with_task(task.id.clone());
                 let _ = self.storage.insert_event(&complete_event);
 
+                // Record backend success for circuit breaker
+                let _ = self.storage.record_backend_success(decision.selected_backend.as_str());
+
                 info!(
                     task_id = %task.id,
                     cost = %result.usage.cost,
@@ -553,6 +635,11 @@ impl Orchestrator {
             }
             Ok(ExecutionStatus::Failed(e)) => {
                 let _ = self.storage.update_task_status(&task.id, TaskStatus::Failed);
+                // Record backend failure for circuit breaker
+                let _ = self.storage.record_backend_failure(
+                    decision.selected_backend.as_str(),
+                    self.circuit_breaker.failure_threshold,
+                );
                 warn!(task_id = %task.id, error = %e, "task execution failed");
                 (None, None)
             }
@@ -940,6 +1027,12 @@ pub enum SubmitError {
     Adapter(AdapterError),
     #[error("unsatisfied dependencies: {0}")]
     UnsatisfiedDependencies(String),
+    #[error("concurrency limit: {0}")]
+    ConcurrencyLimit(String),
+    #[error("rate limit: {0}")]
+    RateLimited(String),
+    #[error("circuit breaker open: {0}")]
+    CircuitBreakerOpen(String),
 }
 
 #[derive(Debug, thiserror::Error)]

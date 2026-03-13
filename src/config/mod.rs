@@ -20,6 +20,9 @@ pub struct GlobalConfig {
     pub projects: Vec<ProjectConfig>,
     pub webhooks: Option<Vec<WebhookConfig>>,
     pub templates: Option<Vec<TemplateConfig>>,
+    pub rate_limits: Option<Vec<RateLimitConfig>>,
+    pub concurrency: Option<ConcurrencyConfig>,
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 /// Configuration for automatic retry of transient failures.
@@ -78,6 +81,68 @@ pub struct TemplateConfig {
     pub max_tokens: Option<u64>,
     pub timeout: Option<u64>,
     pub max_cost: Option<i64>,
+}
+
+/// Per-backend rate limit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    pub backend: String,
+    /// Maximum requests per minute.
+    pub max_requests_per_minute: u32,
+}
+
+/// Concurrency limits for task execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrencyConfig {
+    /// Maximum concurrent running tasks globally.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_global: u32,
+    /// Maximum concurrent running tasks per backend.
+    pub max_concurrent_per_backend: Option<u32>,
+    /// Maximum concurrent running tasks per project.
+    pub max_concurrent_per_project: Option<u32>,
+}
+
+fn default_max_concurrent() -> u32 {
+    10
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_global: 10,
+            max_concurrent_per_backend: None,
+            max_concurrent_per_project: None,
+        }
+    }
+}
+
+/// Circuit breaker configuration for backend failure tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before marking backend as unavailable.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Cooldown period in seconds before retrying a tripped backend.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+fn default_failure_threshold() -> u32 {
+    3
+}
+
+fn default_cooldown_secs() -> u64 {
+    60
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            cooldown_secs: 60,
+        }
+    }
 }
 
 impl TemplateConfig {
@@ -377,6 +442,9 @@ impl GlobalConfig {
             ],
             webhooks: None,
             templates: None,
+            rate_limits: None,
+            concurrency: None,
+            circuit_breaker: None,
         }
     }
 }

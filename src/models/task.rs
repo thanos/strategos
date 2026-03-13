@@ -26,6 +26,7 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub queued_at: Option<DateTime<Utc>>,
+    pub tags: Vec<String>,
 }
 
 impl Task {
@@ -46,6 +47,7 @@ impl Task {
             created_at: now,
             updated_at: now,
             queued_at: None,
+            tags: Vec::new(),
         }
     }
 }

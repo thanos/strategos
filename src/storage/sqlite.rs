@@ -16,7 +16,7 @@ use crate::models::{
     ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
 };
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8};
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -144,6 +144,30 @@ impl SqliteStorage {
                 .execute(
                     "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
                     params![6, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 7 {
+            self.conn
+                .execute_batch(SCHEMA_V7)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![7, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 8 {
+            self.conn
+                .execute_batch(SCHEMA_V8)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![8, Utc::now().to_rfc3339()],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
         }
@@ -315,11 +339,17 @@ impl SqliteStorage {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let override_str = task.backend_override.as_ref().map(|b| b.as_str().to_string());
         let queued_at_str = task.queued_at.map(|dt| dt.to_rfc3339());
+        let tags_json = if task.tags.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&task.tags)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?)
+        };
 
         self.conn
             .execute(
-                "INSERT INTO tasks (id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO tasks (id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at, tags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     task.id.0.to_string(),
                     task.project_id.0.to_string(),
@@ -331,6 +361,7 @@ impl SqliteStorage {
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
                     queued_at_str,
+                    tags_json,
                 ],
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -341,7 +372,7 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at, tags
                  FROM tasks WHERE id = ?1",
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -359,6 +390,7 @@ impl SqliteStorage {
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
                     queued_at: row.get(9)?,
+                    tags: row.get(10)?,
                 })
             })
             .optional()
@@ -374,7 +406,7 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at, tags
                  FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -392,6 +424,7 @@ impl SqliteStorage {
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
                     queued_at: row.get(9)?,
+                    tags: row.get(10)?,
                 })
             })
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1213,7 +1246,7 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at, tags
                  FROM tasks WHERE status = ?1 ORDER BY priority ASC, queued_at ASC",
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1231,6 +1264,7 @@ impl SqliteStorage {
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
                     queued_at: row.get(9)?,
+                    tags: row.get(10)?,
                 })
             })
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1277,6 +1311,251 @@ impl SqliteStorage {
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(count as usize)
+    }
+
+    // -----------------------------------------------------------------------
+    // Task tag search
+    // -----------------------------------------------------------------------
+
+    /// Search tasks by tag. Returns tasks that have the given tag.
+    pub fn search_tasks_by_tag(&self, tag: &str) -> Result<Vec<Task>, StorageError> {
+        // Tags are stored as JSON arrays, search using LIKE with the JSON-encoded tag value
+        let pattern = format!("%\"{}\"%" , tag);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at, tags
+                 FROM tasks WHERE tags LIKE ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![pattern], |row| {
+                Ok(TaskRow {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    task_type: row.get(2)?,
+                    description: row.get(3)?,
+                    priority: row.get(4)?,
+                    status: row.get(5)?,
+                    backend_override: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    queued_at: row.get(9)?,
+                    tags: row.get(10)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            tasks.push(row.into_task()?);
+        }
+        Ok(tasks)
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiting
+    // -----------------------------------------------------------------------
+
+    /// Record a request for rate limiting purposes.
+    pub fn record_rate_limit_request(&self, backend_id: &str) -> Result<(), StorageError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO rate_limit_log (id, backend_id, recorded_at) VALUES (?1, ?2, ?3)",
+                params![id, backend_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Count requests for a backend in the last N seconds.
+    pub fn count_recent_requests(&self, backend_id: &str, window_secs: u64) -> Result<u32, StorageError> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(window_secs as i64)).to_rfc3339();
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM rate_limit_log WHERE backend_id = ?1 AND recorded_at >= ?2",
+                params![backend_id, cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    /// Prune old rate limit log entries (older than window_secs).
+    pub fn prune_rate_limit_log(&self, window_secs: u64) -> Result<usize, StorageError> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(window_secs as i64)).to_rfc3339();
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM rate_limit_log WHERE recorded_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(affected)
+    }
+
+    // -----------------------------------------------------------------------
+    // Circuit breaker state
+    // -----------------------------------------------------------------------
+
+    /// Get circuit breaker state for a backend.
+    pub fn get_circuit_breaker_state(&self, backend_id: &str) -> Result<Option<CircuitBreakerState>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT backend_id, consecutive_failures, last_failure_at, tripped_at, state
+                 FROM circuit_breaker_state WHERE backend_id = ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let result = stmt
+            .query_row(params![backend_id], |row| {
+                Ok(CircuitBreakerState {
+                    backend_id: row.get(0)?,
+                    consecutive_failures: row.get::<_, i64>(1)? as u32,
+                    last_failure_at: row.get(2)?,
+                    tripped_at: row.get(3)?,
+                    state: row.get(4)?,
+                })
+            })
+            .optional()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(result)
+    }
+
+    /// Record a backend failure, incrementing the consecutive failure counter.
+    pub fn record_backend_failure(&self, backend_id: &str, failure_threshold: u32) -> Result<CircuitBreakerState, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let existing = self.get_circuit_breaker_state(backend_id)?;
+
+        let (new_failures, new_state, tripped_at) = match existing {
+            Some(ref s) if s.state == "Open" => {
+                // Already tripped, just update last_failure_at
+                (s.consecutive_failures + 1, "Open".to_string(), s.tripped_at.clone())
+            }
+            Some(ref s) => {
+                let failures = s.consecutive_failures + 1;
+                if failures >= failure_threshold {
+                    (failures, "Open".to_string(), Some(now.clone()))
+                } else {
+                    (failures, "Closed".to_string(), None)
+                }
+            }
+            None => {
+                let failures = 1u32;
+                if failures >= failure_threshold {
+                    (failures, "Open".to_string(), Some(now.clone()))
+                } else {
+                    (failures, "Closed".to_string(), None)
+                }
+            }
+        };
+
+        self.conn
+            .execute(
+                "INSERT INTO circuit_breaker_state (backend_id, consecutive_failures, last_failure_at, tripped_at, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(backend_id) DO UPDATE SET
+                    consecutive_failures = ?2, last_failure_at = ?3, tripped_at = ?4, state = ?5",
+                params![backend_id, new_failures as i64, now, tripped_at, new_state],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(CircuitBreakerState {
+            backend_id: backend_id.to_string(),
+            consecutive_failures: new_failures,
+            last_failure_at: Some(now),
+            tripped_at,
+            state: new_state,
+        })
+    }
+
+    /// Record a backend success, resetting the circuit breaker.
+    pub fn record_backend_success(&self, backend_id: &str) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                "INSERT INTO circuit_breaker_state (backend_id, consecutive_failures, last_failure_at, tripped_at, state)
+                 VALUES (?1, 0, NULL, NULL, 'Closed')
+                 ON CONFLICT(backend_id) DO UPDATE SET
+                    consecutive_failures = 0, last_failure_at = NULL, tripped_at = NULL, state = 'Closed'",
+                params![backend_id],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Check if a circuit breaker has recovered (cooldown elapsed).
+    pub fn check_circuit_breaker_recovery(&self, backend_id: &str, cooldown_secs: u64) -> Result<bool, StorageError> {
+        let state = self.get_circuit_breaker_state(backend_id)?;
+        match state {
+            Some(s) if s.state == "Open" => {
+                if let Some(ref tripped) = s.tripped_at {
+                    let tripped_time = chrono::DateTime::parse_from_rfc3339(tripped)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?
+                        .with_timezone(&Utc);
+                    let elapsed = (Utc::now() - tripped_time).num_seconds() as u64;
+                    Ok(elapsed >= cooldown_secs)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Ok(true), // Closed or not tracked = available
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent task counting
+    // -----------------------------------------------------------------------
+
+    /// Count currently running tasks globally.
+    pub fn count_running_tasks(&self) -> Result<u32, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Running)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = ?1",
+                params![status_str],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    /// Count currently running tasks for a specific project.
+    pub fn count_running_tasks_for_project(&self, project_id: &ProjectId) -> Result<u32, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Running)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = ?1 AND project_id = ?2",
+                params![status_str, project_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    /// Count currently running tasks for a specific backend (via routing_history).
+    pub fn count_running_tasks_for_backend(&self, backend_id: &str) -> Result<u32, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Running)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks t
+                 INNER JOIN routing_history r ON r.task_id = t.id
+                 WHERE t.status = ?1 AND r.selected_backend = ?2",
+                params![status_str, backend_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as u32)
     }
 
     // -----------------------------------------------------------------------
@@ -1758,6 +2037,16 @@ impl UsageStore for ThreadSafeStorage {
     }
 }
 
+/// Circuit breaker state for a backend.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerState {
+    pub backend_id: String,
+    pub consecutive_failures: u32,
+    pub last_failure_at: Option<String>,
+    pub tripped_at: Option<String>,
+    pub state: String,
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping helpers
 // ---------------------------------------------------------------------------
@@ -1879,6 +2168,7 @@ struct TaskRow {
     created_at: String,
     updated_at: String,
     queued_at: Option<String>,
+    tags: Option<String>,
 }
 
 impl TaskRow {
@@ -1909,6 +2199,12 @@ impl TaskRow {
             })
             .transpose()?;
 
+        let tags: Vec<String> = match self.tags {
+            Some(ref s) => serde_json::from_str(s)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            None => Vec::new(),
+        };
+
         Ok(Task {
             id: TaskId(id),
             project_id: ProjectId(project_id),
@@ -1920,6 +2216,7 @@ impl TaskRow {
             created_at,
             updated_at,
             queued_at,
+            tags,
         })
     }
 }
@@ -2370,13 +2667,13 @@ mod tests {
     fn schema_v2_migration_creates_indexes() {
         let storage = SqliteStorage::in_memory().unwrap();
 
-        // Verify migration version is 6 (V1-V6)
+        // Verify migration version is 8 (V1-V8)
         let version: i64 = storage.conn.query_row(
             "SELECT MAX(version) FROM _migrations",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 8);
 
         // Verify indexes exist
         let index_count: i64 = storage.conn.query_row(

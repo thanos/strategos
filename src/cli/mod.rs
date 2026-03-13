@@ -77,6 +77,9 @@ pub enum Commands {
         /// Use a task template by name
         #[arg(long)]
         template: Option<String>,
+        /// Comma-separated tags for the task
+        #[arg(long)]
+        tag: Option<String>,
     },
 
     /// Show budget status
@@ -108,6 +111,9 @@ pub enum Commands {
     Tasks {
         /// Project name
         project: String,
+        /// Filter tasks by tag
+        #[arg(long)]
+        tag: Option<String>,
     },
 
     /// Show or retry a task
@@ -469,14 +475,18 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             queue,
             priority,
             template,
+            tag,
         } => {
-            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost, depends_on, queue, priority, template.as_deref()).await
+            let tags: Vec<String> = tag
+                .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default();
+            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost, depends_on, queue, priority, template.as_deref(), tags).await
         }
         Commands::Budget => cmd_budget(&config),
         Commands::Events { limit, event_type, project, task, since, until } => {
             cmd_events(&config, limit, event_type, project, task, since, until)
         }
-        Commands::Tasks { project } => cmd_tasks(&config, &project),
+        Commands::Tasks { project, tag } => cmd_tasks(&config, &project, tag.as_deref()),
         Commands::Task(sub) => cmd_task(sub, &config).await,
         Commands::Actions(sub) => cmd_actions(sub, &config),
         Commands::Status => cmd_status(&config),
@@ -621,6 +631,7 @@ async fn cmd_submit(
     queue: bool,
     priority: Option<crate::models::Priority>,
     template_name: Option<&str>,
+    tags: Vec<String>,
 ) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
     let project = storage
@@ -666,6 +677,9 @@ async fn cmd_submit(
     }
     if let Some(p) = priority {
         task.priority = p;
+    }
+    if !tags.is_empty() {
+        task.tags = tags;
     }
 
     // Resolve and validate dependencies
@@ -893,32 +907,45 @@ fn cmd_events(
     Ok(())
 }
 
-fn cmd_tasks(config: &GlobalConfig, project_name: &str) -> Result<()> {
+fn cmd_tasks(config: &GlobalConfig, project_name: &str, tag_filter: Option<&str>) -> Result<()> {
     let storage = open_storage(config)?;
     let project = storage
         .get_project_by_name(project_name)?
         .ok_or_else(|| anyhow::anyhow!("project '{}' not found", project_name))?;
 
-    let tasks = storage.list_tasks_by_project(&project.id)?;
+    let tasks = if let Some(tag) = tag_filter {
+        storage.search_tasks_by_tag(tag)?
+            .into_iter()
+            .filter(|t| t.project_id == project.id)
+            .collect()
+    } else {
+        storage.list_tasks_by_project(&project.id)?
+    };
 
     if tasks.is_empty() {
         println!("No tasks for project '{}'.", project_name);
         return Ok(());
     }
 
-    println!("{:<12} {:<20} {:<12} {}", "STATUS", "TYPE", "PRIORITY", "DESCRIPTION");
-    println!("{}", "-".repeat(70));
+    println!("{:<12} {:<20} {:<12} {:<20} {}", "STATUS", "TYPE", "PRIORITY", "TAGS", "DESCRIPTION");
+    println!("{}", "-".repeat(90));
     for task in &tasks {
         let desc = if task.description.len() > 30 {
             format!("{}...", &task.description[..30])
         } else {
             task.description.clone()
         };
+        let tags_str = if task.tags.is_empty() {
+            "-".to_string()
+        } else {
+            task.tags.join(", ")
+        };
         println!(
-            "{:<12} {:<20} {:<12} {}",
+            "{:<12} {:<20} {:<12} {:<20} {}",
             format!("{:?}", task.status),
             format!("{:?}", task.task_type),
             format!("{:?}", task.priority),
+            tags_str,
             desc
         );
     }
@@ -2134,6 +2161,15 @@ fn build_orchestrator(
     }
     if let Some(ref webhooks) = config.webhooks {
         orchestrator.webhooks = webhooks.clone();
+    }
+    if let Some(ref rate_limits) = config.rate_limits {
+        orchestrator.rate_limits = rate_limits.clone();
+    }
+    if let Some(ref concurrency) = config.concurrency {
+        orchestrator.concurrency = Some(concurrency.clone());
+    }
+    if let Some(ref cb) = config.circuit_breaker {
+        orchestrator.circuit_breaker = cb.clone();
     }
     Ok(orchestrator)
 }
