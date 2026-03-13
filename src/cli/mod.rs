@@ -13,6 +13,7 @@ use crate::adapters::opencode::{OpenCodeAdapter, OpenCodeConfig};
 use crate::adapters::traits::AdapterRegistry;
 use crate::budget::governor::{BudgetConfig, BudgetGovernor, InMemoryUsageStore};
 use crate::config::GlobalConfig;
+use crate::models::event::{Event, EventType};
 use crate::models::policy::{PendingAction, PendingActionType};
 use crate::models::project::Project;
 use crate::models::task::Task;
@@ -47,9 +48,9 @@ pub enum Commands {
         /// Project name
         #[arg(long)]
         project: String,
-        /// Task type
+        /// Task type (optional when --template is used)
         #[arg(long, value_parser = parse_task_type)]
-        task_type: TaskType,
+        task_type: Option<TaskType>,
         /// Task description / prompt
         description: Vec<String>,
         /// Override backend selection
@@ -67,6 +68,15 @@ pub enum Commands {
         /// Comma-separated task ID prefixes this task depends on
         #[arg(long)]
         depends_on: Option<String>,
+        /// Queue the task instead of executing immediately
+        #[arg(long)]
+        queue: bool,
+        /// Task priority (low, normal, high, critical)
+        #[arg(long, value_parser = parse_priority)]
+        priority: Option<crate::models::Priority>,
+        /// Use a task template by name
+        #[arg(long)]
+        template: Option<String>,
     },
 
     /// Show budget status
@@ -180,6 +190,18 @@ pub enum Commands {
         backend: Option<String>,
     },
 
+    /// Manage the task queue
+    #[command(subcommand)]
+    Queue(QueueCommands),
+
+    /// Manage webhooks
+    #[command(subcommand)]
+    Webhooks(WebhookCommands),
+
+    /// Manage task templates
+    #[command(subcommand)]
+    Templates(TemplateCommands),
+
     /// Show current configuration
     Config,
 }
@@ -271,6 +293,58 @@ pub enum TaskCommands {
         #[arg(long)]
         backend: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum QueueCommands {
+    /// List queued tasks
+    List,
+    /// Run the next queued task
+    Run {
+        /// Project name (for routing config)
+        #[arg(long)]
+        project: String,
+    },
+    /// Show queue count
+    Count,
+}
+
+#[derive(Subcommand)]
+pub enum WebhookCommands {
+    /// List configured webhooks
+    List,
+    /// Test a webhook by sending a test event
+    Test {
+        /// Webhook name
+        name: String,
+    },
+    /// Show recent webhook deliveries
+    Deliveries {
+        /// Number of deliveries to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TemplateCommands {
+    /// List available templates
+    List,
+    /// Show template details
+    Show {
+        /// Template name
+        name: String,
+    },
+}
+
+fn parse_priority(s: &str) -> Result<crate::models::Priority, String> {
+    match s.to_lowercase().as_str() {
+        "low" => Ok(crate::models::Priority::Low),
+        "normal" => Ok(crate::models::Priority::Normal),
+        "high" => Ok(crate::models::Priority::High),
+        "critical" => Ok(crate::models::Priority::Critical),
+        _ => Err(format!("unknown priority: '{}'. Valid: low, normal, high, critical", s)),
+    }
 }
 
 fn parse_task_type(s: &str) -> Result<TaskType, String> {
@@ -392,8 +466,11 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             timeout,
             max_cost,
             depends_on,
+            queue,
+            priority,
+            template,
         } => {
-            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost, depends_on).await
+            cmd_submit(&config, &project, task_type, &description.join(" "), backend, max_tokens, timeout, max_cost, depends_on, queue, priority, template.as_deref()).await
         }
         Commands::Budget => cmd_budget(&config),
         Commands::Events { limit, event_type, project, task, since, until } => {
@@ -426,6 +503,9 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
             description,
             backend,
         } => cmd_dry_run(&config, &project, task_type, &description.join(" "), backend).await,
+        Commands::Queue(sub) => cmd_queue(sub, &config).await,
+        Commands::Webhooks(sub) => cmd_webhooks(sub, &config),
+        Commands::Templates(sub) => cmd_templates(sub, &config),
         Commands::Config => cmd_config(&config, &cli.config_path),
     }
 }
@@ -531,13 +611,16 @@ fn cmd_project(sub: ProjectCommands, config: &GlobalConfig) -> Result<()> {
 async fn cmd_submit(
     config: &GlobalConfig,
     project_name: &str,
-    task_type: TaskType,
+    task_type_opt: Option<TaskType>,
     description: &str,
     backend_override: Option<String>,
     max_tokens: Option<u64>,
     timeout_secs: Option<u64>,
     max_cost_cents: Option<i64>,
     depends_on: Option<String>,
+    queue: bool,
+    priority: Option<crate::models::Priority>,
+    template_name: Option<&str>,
 ) -> Result<()> {
     let storage = Arc::new(open_storage(config)?);
     let project = storage
@@ -546,9 +629,43 @@ async fn cmd_submit(
 
     let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
 
-    let mut task = Task::new(project.id.clone(), task_type, description);
-    if let Some(ref b) = backend_override {
+    // Resolve template if provided
+    let (task_type, final_description, tmpl_backend, tmpl_max_tokens, tmpl_timeout, tmpl_max_cost) =
+        if let Some(tmpl_name) = template_name {
+            let templates = config.templates.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no templates configured"))?;
+            let tmpl = templates.iter().find(|t| t.name == tmpl_name)
+                .ok_or_else(|| anyhow::anyhow!("template '{}' not found", tmpl_name))?;
+            let tt = parse_task_type(&tmpl.task_type)
+                .map_err(|e| anyhow::anyhow!("template task_type error: {}", e))?;
+            let desc = if description.is_empty() {
+                let args: Vec<&str> = Vec::new();
+                tmpl.resolve_description(&args)
+                    .map_err(|e| anyhow::anyhow!("template error: {}", e))?
+            } else {
+                let args: Vec<&str> = description.split_whitespace().collect();
+                tmpl.resolve_description(&args)
+                    .unwrap_or_else(|_| description.to_string())
+            };
+            let tt_override = task_type_opt.unwrap_or(tt);
+            (tt_override, desc, tmpl.backend.clone(), tmpl.max_tokens, tmpl.timeout, tmpl.max_cost)
+        } else {
+            let tt = task_type_opt
+                .ok_or_else(|| anyhow::anyhow!("--task-type is required (or use --template)"))?;
+            (tt, description.to_string(), None, None, None, None)
+        };
+
+    let effective_backend = backend_override.or(tmpl_backend);
+    let effective_max_tokens = max_tokens.or(tmpl_max_tokens);
+    let effective_timeout = timeout_secs.or(tmpl_timeout);
+    let effective_max_cost = max_cost_cents.or(tmpl_max_cost);
+
+    let mut task = Task::new(project.id.clone(), task_type, &final_description);
+    if let Some(ref b) = effective_backend {
         task.backend_override = Some(BackendId::new(b));
+    }
+    if let Some(p) = priority {
+        task.priority = p;
     }
 
     // Resolve and validate dependencies
@@ -580,20 +697,27 @@ async fn cmd_submit(
         }
     }
 
+    // Queue mode: just queue the task and return
+    if queue {
+        orchestrator.queue_task(&mut task)?;
+        println!("Task {} queued (priority: {:?}, rank: {})", &task.id.0.to_string()[..8], task.priority, task.priority.rank());
+        return Ok(());
+    }
+
     let project_config = build_project_routing_config(config, &project);
 
     println!("Submitting {:?} task to project '{}'...", task_type, project_name);
 
     let estimated_cost = estimate_task_cost(
-        description,
+        &final_description,
         &config.default_backend,
         config.backends.claude.as_ref().map(|c| c.model.as_str()).unwrap_or("claude-sonnet-4-20250514"),
     );
 
     let constraints = crate::adapters::traits::ExecutionConstraints {
-        max_tokens,
-        max_cost_cents: max_cost_cents,
-        timeout: timeout_secs.map(std::time::Duration::from_secs),
+        max_tokens: effective_max_tokens,
+        max_cost_cents: effective_max_cost,
+        timeout: effective_timeout.map(std::time::Duration::from_secs),
         ..crate::adapters::traits::ExecutionConstraints::default()
     };
 
@@ -1731,6 +1855,183 @@ async fn cmd_dry_run(
     Ok(())
 }
 
+async fn cmd_queue(sub: QueueCommands, config: &GlobalConfig) -> Result<()> {
+    let storage = Arc::new(open_storage(config)?);
+    let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
+
+    match sub {
+        QueueCommands::List => {
+            let queued = orchestrator.list_queued_tasks()?;
+            if queued.is_empty() {
+                println!("No tasks in queue.");
+            } else {
+                println!("{:<12} {:<10} {:<20} {}", "ID", "PRIORITY", "TYPE", "DESCRIPTION");
+                println!("{}", "-".repeat(70));
+                for task in &queued {
+                    let id_short = &task.id.0.to_string()[..8];
+                    let desc_short = if task.description.len() > 30 {
+                        format!("{}...", &task.description[..30])
+                    } else {
+                        task.description.clone()
+                    };
+                    println!(
+                        "{:<12} {:<10} {:<20} {}",
+                        id_short,
+                        format!("{:?}", task.priority),
+                        format!("{:?}", task.task_type),
+                        desc_short
+                    );
+                }
+                println!("\n{} task(s) in queue", queued.len());
+            }
+        }
+        QueueCommands::Run { project } => {
+            let proj = storage
+                .get_project_by_name(&project)?
+                .ok_or_else(|| anyhow::anyhow!("project '{}' not found", project))?;
+            let project_config = build_project_routing_config(config, &proj);
+            let estimated_cost = MoneyAmount::from_cents(100); // default estimate
+            match orchestrator.run_next_queued(project_config, estimated_cost).await? {
+                Some(result) => {
+                    println!("Dequeued and ran task: {}", result.task.id.0);
+                    println!(
+                        "Routed to: {} (reason: {:?})",
+                        result.routing_decision.selected_backend, result.routing_decision.reason
+                    );
+                    if let Some(output) = result.execution_output {
+                        println!("\n--- Output ---\n{}", output);
+                    }
+                }
+                None => {
+                    println!("Queue is empty. Nothing to run.");
+                }
+            }
+        }
+        QueueCommands::Count => {
+            let count = orchestrator.count_queued_tasks()?;
+            println!("{} task(s) in queue", count);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_webhooks(sub: WebhookCommands, config: &GlobalConfig) -> Result<()> {
+    match sub {
+        WebhookCommands::List => {
+            let webhooks = config.webhooks.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+            if webhooks.is_empty() {
+                println!("No webhooks configured.");
+            } else {
+                println!("{:<20} {:<40} {:<10} {}", "NAME", "URL", "ENABLED", "EVENTS");
+                println!("{}", "-".repeat(80));
+                for wh in webhooks {
+                    let events = wh.events.as_ref()
+                        .map(|e| e.join(", "))
+                        .unwrap_or_else(|| "all".into());
+                    println!(
+                        "{:<20} {:<40} {:<10} {}",
+                        wh.name, wh.url, wh.enabled, events
+                    );
+                }
+            }
+        }
+        WebhookCommands::Test { name } => {
+            let storage = Arc::new(open_storage(config)?);
+            let orchestrator = build_orchestrator(config, Arc::clone(&storage))?;
+            let webhooks = config.webhooks.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+            let wh = webhooks.iter().find(|w| w.name == name)
+                .ok_or_else(|| anyhow::anyhow!("webhook '{}' not found", name))?;
+
+            let test_event = Event::new(
+                EventType::WebhookDispatched,
+                serde_json::json!({"test": true, "webhook": wh.name}),
+            );
+            orchestrator.dispatch_webhooks(&test_event);
+            println!("Test event dispatched to webhook '{}'", name);
+        }
+        WebhookCommands::Deliveries { limit } => {
+            let storage = open_storage(config)?;
+            let deliveries = storage.list_webhook_deliveries(limit)?;
+            if deliveries.is_empty() {
+                println!("No webhook deliveries recorded.");
+            } else {
+                println!("{:<20} {:<20} {:<20} {:<8} {}", "TIMESTAMP", "WEBHOOK", "EVENT", "OK", "URL");
+                println!("{}", "-".repeat(80));
+                for d in &deliveries {
+                    let ts = d.delivered_at.format("%Y-%m-%d %H:%M:%S");
+                    println!(
+                        "{:<20} {:<20} {:<20} {:<8} {}",
+                        ts,
+                        d.webhook_name,
+                        format!("{:?}", d.event_type),
+                        if d.success { "yes" } else { "no" },
+                        d.url
+                    );
+                }
+                println!("\n{} delivery(ies)", deliveries.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_templates(sub: TemplateCommands, config: &GlobalConfig) -> Result<()> {
+    let templates = config.templates.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+
+    match sub {
+        TemplateCommands::List => {
+            if templates.is_empty() {
+                println!("No templates configured.");
+            } else {
+                println!("{:<20} {:<25} {}", "NAME", "TASK TYPE", "DESCRIPTION");
+                println!("{}", "-".repeat(70));
+                for tmpl in templates {
+                    let desc = tmpl.description.as_deref().unwrap_or("-");
+                    let desc_short = if desc.len() > 30 {
+                        format!("{}...", &desc[..30])
+                    } else {
+                        desc.to_string()
+                    };
+                    println!("{:<20} {:<25} {}", tmpl.name, tmpl.task_type, desc_short);
+                }
+            }
+        }
+        TemplateCommands::Show { name } => {
+            let tmpl = templates.iter().find(|t| t.name == name)
+                .ok_or_else(|| anyhow::anyhow!("template '{}' not found", name))?;
+            println!("Template: {}", tmpl.name);
+            println!("Task type: {}", tmpl.task_type);
+            if let Some(ref desc) = tmpl.description {
+                println!("Description: {}", desc);
+            }
+            if let Some(ref backend) = tmpl.backend {
+                println!("Backend: {}", backend);
+            }
+            if let Some(ref priority) = tmpl.priority {
+                println!("Priority: {}", priority);
+            }
+            if let Some(tokens) = tmpl.max_tokens {
+                println!("Max tokens: {}", tokens);
+            }
+            if let Some(timeout) = tmpl.timeout {
+                println!("Timeout: {}s", timeout);
+            }
+            if let Some(cost) = tmpl.max_cost {
+                println!("Max cost: {} cents", cost);
+            }
+            let errors = tmpl.validate();
+            if !errors.is_empty() {
+                println!("\nValidation errors:");
+                for err in &errors {
+                    println!("  - {}", err);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_config(config: &GlobalConfig, config_path: &PathBuf) -> Result<()> {
     println!("Config file: {}", config_path.display());
     println!("Storage: {}", config.storage_path().display());
@@ -1826,7 +2127,13 @@ fn build_orchestrator(
         orchestrator.retry_policy = crate::orchestrator::service::RetryPolicy {
             max_retries: retry_cfg.max_retries,
             retry_delay: std::time::Duration::from_millis(retry_cfg.retry_delay_ms),
+            backoff_multiplier: retry_cfg.backoff_multiplier,
+            max_delay: std::time::Duration::from_millis(retry_cfg.max_delay_ms),
+            jitter_fraction: retry_cfg.jitter_fraction,
         };
+    }
+    if let Some(ref webhooks) = config.webhooks {
+        orchestrator.webhooks = webhooks.clone();
     }
     Ok(orchestrator)
 }

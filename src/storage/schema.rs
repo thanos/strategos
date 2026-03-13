@@ -109,3 +109,26 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on_task_id);
 "#;
+
+/// V5: Add queued_at column to tasks and priority index for queue ordering.
+pub const SCHEMA_V5: &str = r#"
+ALTER TABLE tasks ADD COLUMN queued_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_priority_queued ON tasks(priority, queued_at);
+"#;
+
+/// V6: Add webhook_deliveries table for webhook event tracking.
+pub const SCHEMA_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id              TEXT PRIMARY KEY,
+    webhook_name    TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    payload         TEXT,
+    status_code     INTEGER,
+    success         INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    delivered_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_at ON webhook_deliveries(delivered_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_name ON webhook_deliveries(webhook_name);
+"#;

@@ -15,9 +15,11 @@ pub enum EventType {
     BackendDowngradeApplied,
     ReviewQueued,
     CommitSuggested,
+    TaskQueued,
     ActionCreated,
     ActionApproved,
     ActionDismissed,
+    WebhookDispatched,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,4 +53,18 @@ impl Event {
         self.task_id = Some(task_id);
         self
     }
+}
+
+/// Record of a webhook delivery attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub webhook_name: String,
+    pub url: String,
+    pub event_type: EventType,
+    pub payload: serde_json::Value,
+    pub status_code: Option<u16>,
+    pub success: bool,
+    pub error: Option<String>,
+    pub delivered_at: DateTime<Utc>,
 }

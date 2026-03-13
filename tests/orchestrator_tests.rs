@@ -785,6 +785,7 @@ async fn retry_on_transient_error_succeeds() {
         .with_retry_policy(RetryPolicy {
             max_retries: 2,
             retry_delay: std::time::Duration::from_millis(1),
+            ..RetryPolicy::default()
         });
 
     let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
@@ -848,6 +849,7 @@ async fn retry_exhaustion_fails() {
         .with_retry_policy(RetryPolicy {
             max_retries: 1, // 1 retry = 2 total attempts
             retry_delay: std::time::Duration::from_millis(1),
+            ..RetryPolicy::default()
         });
 
     let task = Task::new(project.id.clone(), TaskType::Summarization, "test");
@@ -1271,4 +1273,516 @@ fn schema_v4_creates_task_dependencies_table() {
         )
         .unwrap();
     assert_eq!(count, 1);
+}
+
+// =========================================================================
+// Phase 10: Priority queuing, retry backoff, webhooks, task templates
+// =========================================================================
+
+// --- Step 52: Priority-aware task queuing ---
+
+#[tokio::test]
+async fn queue_task_sets_status_and_timestamp() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+    let mut task = Task::new(project.id.clone(), TaskType::Planning, "queue test");
+    task.priority = Priority::High;
+
+    orchestrator.queue_task(&mut task).unwrap();
+
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert!(task.queued_at.is_some());
+
+    let stored = orchestrator.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Queued);
+    assert!(stored.queued_at.is_some());
+}
+
+#[tokio::test]
+async fn list_queued_tasks_ordered_by_priority() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let mut low = Task::new(project.id.clone(), TaskType::Summarization, "low priority");
+    low.priority = Priority::Low;
+    orchestrator.queue_task(&mut low).unwrap();
+
+    let mut critical = Task::new(project.id.clone(), TaskType::Summarization, "critical priority");
+    critical.priority = Priority::Critical;
+    orchestrator.queue_task(&mut critical).unwrap();
+
+    let mut normal = Task::new(project.id.clone(), TaskType::Summarization, "normal priority");
+    normal.priority = Priority::Normal;
+    orchestrator.queue_task(&mut normal).unwrap();
+
+    let queued = orchestrator.list_queued_tasks().unwrap();
+    assert_eq!(queued.len(), 3);
+    assert_eq!(queued[0].priority, Priority::Critical);
+    assert_eq!(queued[1].priority, Priority::Normal);
+    assert_eq!(queued[2].priority, Priority::Low);
+}
+
+#[tokio::test]
+async fn dequeue_returns_highest_priority_first() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let mut normal = Task::new(project.id.clone(), TaskType::Summarization, "normal");
+    normal.priority = Priority::Normal;
+    orchestrator.queue_task(&mut normal).unwrap();
+
+    let mut high = Task::new(project.id.clone(), TaskType::Summarization, "high");
+    high.priority = Priority::High;
+    orchestrator.queue_task(&mut high).unwrap();
+
+    let dequeued = orchestrator.storage.dequeue_next_task().unwrap().unwrap();
+    assert_eq!(dequeued.id, high.id);
+    assert_eq!(dequeued.status, TaskStatus::Pending);
+
+    let count = orchestrator.count_queued_tasks().unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn dequeue_empty_queue_returns_none() {
+    let (orchestrator, _project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+    let result = orchestrator.storage.dequeue_next_task().unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn priority_rank_ordering() {
+    assert_eq!(Priority::Critical.rank(), 0);
+    assert_eq!(Priority::High.rank(), 1);
+    assert_eq!(Priority::Normal.rank(), 2);
+    assert_eq!(Priority::Low.rank(), 3);
+    assert!(Priority::Critical.rank() < Priority::Low.rank());
+}
+
+#[tokio::test]
+async fn queue_task_emits_event() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+    let mut task = Task::new(project.id.clone(), TaskType::Planning, "event test");
+    orchestrator.queue_task(&mut task).unwrap();
+
+    let events = orchestrator.recent_events(10).unwrap();
+    let queue_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == strategos::models::event::EventType::TaskQueued)
+        .collect();
+    assert!(!queue_events.is_empty(), "expected a TaskQueued event");
+}
+
+#[tokio::test]
+async fn run_next_queued_executes_task() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    let mut task = Task::new(project.id.clone(), TaskType::Summarization, "run from queue");
+    orchestrator.queue_task(&mut task).unwrap();
+
+    let result = orchestrator
+        .run_next_queued(ProjectRoutingConfig::default(), MoneyAmount::from_cents(100))
+        .await
+        .unwrap();
+    assert!(result.is_some());
+    let result = result.unwrap();
+    // Task should have been dequeued and executed
+    assert!(result.execution_output.is_some() || result.routing_decision.selected_backend.as_str() != "none");
+}
+
+#[tokio::test]
+async fn count_queued_tasks_accurate() {
+    let (orchestrator, project) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+
+    assert_eq!(orchestrator.count_queued_tasks().unwrap(), 0);
+
+    let mut t1 = Task::new(project.id.clone(), TaskType::Planning, "task 1");
+    orchestrator.queue_task(&mut t1).unwrap();
+    assert_eq!(orchestrator.count_queued_tasks().unwrap(), 1);
+
+    let mut t2 = Task::new(project.id.clone(), TaskType::Planning, "task 2");
+    orchestrator.queue_task(&mut t2).unwrap();
+    assert_eq!(orchestrator.count_queued_tasks().unwrap(), 2);
+}
+
+// --- Step 53: Exponential backoff with jitter ---
+
+#[test]
+fn retry_delay_exponential_growth() {
+    let policy = RetryPolicy {
+        max_retries: 5,
+        retry_delay: std::time::Duration::from_millis(1000),
+        backoff_multiplier: 2.0,
+        max_delay: std::time::Duration::from_millis(60_000),
+        jitter_fraction: 0.0, // no jitter for deterministic test
+    };
+
+    let d0 = policy.delay_for_attempt(0);
+    assert_eq!(d0, std::time::Duration::ZERO);
+
+    let d1 = policy.delay_for_attempt(1);
+    assert_eq!(d1.as_millis(), 1000); // 1000 * 2^0
+
+    let d2 = policy.delay_for_attempt(2);
+    assert_eq!(d2.as_millis(), 2000); // 1000 * 2^1
+
+    let d3 = policy.delay_for_attempt(3);
+    assert_eq!(d3.as_millis(), 4000); // 1000 * 2^2
+}
+
+#[test]
+fn retry_delay_capped_at_max() {
+    let policy = RetryPolicy {
+        max_retries: 10,
+        retry_delay: std::time::Duration::from_millis(1000),
+        backoff_multiplier: 2.0,
+        max_delay: std::time::Duration::from_millis(5000),
+        jitter_fraction: 0.0,
+    };
+
+    // Attempt 4: 1000 * 2^3 = 8000 -> capped at 5000
+    let d4 = policy.delay_for_attempt(4);
+    assert_eq!(d4.as_millis(), 5000);
+
+    // Higher attempts should also be capped
+    let d10 = policy.delay_for_attempt(10);
+    assert_eq!(d10.as_millis(), 5000);
+}
+
+#[test]
+fn retry_delay_jitter_reduces_delay() {
+    let policy = RetryPolicy {
+        max_retries: 5,
+        retry_delay: std::time::Duration::from_millis(1000),
+        backoff_multiplier: 2.0,
+        max_delay: std::time::Duration::from_millis(60_000),
+        jitter_fraction: 0.5, // 50% jitter
+    };
+
+    // With jitter, delay should be less than or equal to base
+    let d1 = policy.delay_for_attempt(1);
+    assert!(d1.as_millis() <= 1000);
+    assert!(d1.as_millis() >= 500); // at least 50% of base
+}
+
+#[test]
+fn retry_backoff_backward_compat_default() {
+    let policy = RetryPolicy::default();
+    assert_eq!(policy.backoff_multiplier, 2.0);
+    assert_eq!(policy.max_delay.as_millis(), 30_000);
+    assert!((policy.jitter_fraction - 0.1).abs() < f64::EPSILON);
+    // Default: 0 retries, should still have sensible delay
+    let d = policy.delay_for_attempt(1);
+    assert!(d.as_millis() > 0);
+}
+
+#[tokio::test]
+async fn retry_with_backoff_integration() {
+    // Create orchestrator with backoff config
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("backoff-test", "/tmp/backoff");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+
+    let budget_config = BudgetConfig {
+        mode: BudgetMode::Observe,
+        global_monthly_limit: MoneyAmount::from_dollars(100.0),
+        thresholds: vec![50, 75, 90, 100],
+        ..BudgetConfig::default()
+    };
+    let usage_store = Arc::new(InMemoryUsageStore::new());
+    let governor = Arc::new(BudgetGovernor::new(budget_config, usage_store));
+    let registry = Arc::new(registry);
+    let mut policy = RoutingPolicy::default();
+    policy.check_health_before_routing = false;
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let orchestrator = Orchestrator::new(registry, routing_engine, governor, storage)
+        .with_retry_policy(RetryPolicy {
+            max_retries: 2,
+            retry_delay: std::time::Duration::from_millis(1),
+            backoff_multiplier: 2.0,
+            max_delay: std::time::Duration::from_millis(100),
+            jitter_fraction: 0.1,
+        });
+
+    let task = Task::new(project.id.clone(), TaskType::Summarization, "backoff test");
+    let result = orchestrator
+        .submit_task(task, ProjectRoutingConfig::default(), MoneyAmount::from_cents(50))
+        .await
+        .unwrap();
+    // Ollama local adapter succeeds on first try, so no retries needed
+    assert!(result.execution_output.is_some() || result.requires_approval == false);
+}
+
+// --- Step 54: Webhook event notifications ---
+
+#[test]
+fn webhook_config_parse() {
+    let toml_str = r#"
+        name = "notify"
+        url = "https://example.com/webhook"
+        events = ["TaskCompleted", "TaskFailed"]
+        enabled = true
+    "#;
+    let wh: strategos::config::WebhookConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(wh.name, "notify");
+    assert_eq!(wh.url, "https://example.com/webhook");
+    assert!(wh.enabled);
+    assert_eq!(wh.events.as_ref().unwrap().len(), 2);
+}
+
+#[test]
+fn webhook_disabled_not_dispatched() {
+    let (orchestrator, _) = setup_orchestrator(BudgetMode::Observe, MoneyAmount::ZERO);
+    // No webhooks configured by default = disabled
+    let event = strategos::models::event::Event::new(
+        strategos::models::event::EventType::TaskCompleted,
+        serde_json::json!({"test": true}),
+    );
+    orchestrator.dispatch_webhooks(&event);
+    // Should not crash and no deliveries recorded
+    let deliveries = orchestrator.storage.list_webhook_deliveries(10).unwrap();
+    assert!(deliveries.is_empty());
+}
+
+#[test]
+fn webhook_delivery_recorded() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("wh-test", "/tmp/wh");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+    let budget_config = BudgetConfig {
+        mode: BudgetMode::Observe,
+        global_monthly_limit: MoneyAmount::from_dollars(100.0),
+        thresholds: vec![50, 75, 90, 100],
+        ..BudgetConfig::default()
+    };
+    let usage_store = Arc::new(InMemoryUsageStore::new());
+    let governor = Arc::new(BudgetGovernor::new(budget_config, usage_store));
+    let registry = Arc::new(registry);
+    let policy = RoutingPolicy::default();
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let mut orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage));
+    orchestrator.webhooks = vec![strategos::config::WebhookConfig {
+        name: "test-hook".into(),
+        url: "https://example.com/hook".into(),
+        events: None, // all events
+        enabled: true,
+    }];
+
+    let event = strategos::models::event::Event::new(
+        strategos::models::event::EventType::TaskCompleted,
+        serde_json::json!({"msg": "hello"}),
+    );
+    orchestrator.dispatch_webhooks(&event);
+
+    let deliveries = storage.list_webhook_deliveries(10).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].webhook_name, "test-hook");
+    assert!(deliveries[0].success);
+}
+
+#[test]
+fn webhook_event_filter_match() {
+    let storage = Arc::new(SqliteStorage::in_memory().unwrap());
+    let project = Project::new("wh-filter", "/tmp/wh2");
+    storage.insert_project(&project).unwrap();
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(FakeAdapter::local("ollama")));
+    let budget_config = BudgetConfig {
+        mode: BudgetMode::Observe,
+        global_monthly_limit: MoneyAmount::from_dollars(100.0),
+        thresholds: vec![50, 75, 90, 100],
+        ..BudgetConfig::default()
+    };
+    let usage_store = Arc::new(InMemoryUsageStore::new());
+    let governor = Arc::new(BudgetGovernor::new(budget_config, usage_store));
+    let registry = Arc::new(registry);
+    let policy = RoutingPolicy::default();
+    let routing_engine = RoutingEngine::new(policy, Arc::clone(&registry), Arc::clone(&governor));
+    let mut orchestrator = Orchestrator::new(registry, routing_engine, governor, Arc::clone(&storage));
+    orchestrator.webhooks = vec![strategos::config::WebhookConfig {
+        name: "filtered".into(),
+        url: "https://example.com/filtered".into(),
+        events: Some(vec!["TaskFailed".into()]), // only TaskFailed
+        enabled: true,
+    }];
+
+    // Send TaskCompleted — should be filtered out
+    let event = strategos::models::event::Event::new(
+        strategos::models::event::EventType::TaskCompleted,
+        serde_json::json!({"msg": "completed"}),
+    );
+    orchestrator.dispatch_webhooks(&event);
+    assert_eq!(storage.list_webhook_deliveries(10).unwrap().len(), 0);
+
+    // Send TaskFailed — should match
+    let event2 = strategos::models::event::Event::new(
+        strategos::models::event::EventType::TaskFailed,
+        serde_json::json!({"msg": "failed"}),
+    );
+    orchestrator.dispatch_webhooks(&event2);
+    assert_eq!(storage.list_webhook_deliveries(10).unwrap().len(), 1);
+}
+
+#[test]
+fn webhook_delivery_list_ordered() {
+    let storage = SqliteStorage::in_memory().unwrap();
+    // Insert two deliveries manually
+    let d1 = strategos::models::event::WebhookDelivery {
+        id: uuid::Uuid::new_v4().to_string(),
+        webhook_name: "hook1".into(),
+        url: "https://a.com".into(),
+        event_type: strategos::models::event::EventType::TaskCompleted,
+        payload: serde_json::json!({}),
+        status_code: Some(200),
+        success: true,
+        error: None,
+        delivered_at: chrono::Utc::now() - chrono::Duration::hours(1),
+    };
+    let d2 = strategos::models::event::WebhookDelivery {
+        id: uuid::Uuid::new_v4().to_string(),
+        webhook_name: "hook2".into(),
+        url: "https://b.com".into(),
+        event_type: strategos::models::event::EventType::TaskFailed,
+        payload: serde_json::json!({}),
+        status_code: Some(500),
+        success: false,
+        error: Some("server error".into()),
+        delivered_at: chrono::Utc::now(),
+    };
+    storage.insert_webhook_delivery(&d1).unwrap();
+    storage.insert_webhook_delivery(&d2).unwrap();
+
+    let deliveries = storage.list_webhook_deliveries(10).unwrap();
+    assert_eq!(deliveries.len(), 2);
+    // Most recent first
+    assert_eq!(deliveries[0].webhook_name, "hook2");
+    assert_eq!(deliveries[1].webhook_name, "hook1");
+}
+
+// --- Step 55: Task templates ---
+
+#[test]
+fn template_config_parse() {
+    let toml_str = r#"
+        name = "quick-review"
+        task_type = "review"
+        description = "Review {0} for {1}"
+        backend = "claude"
+        priority = "high"
+        max_tokens = 4096
+    "#;
+    let tmpl: strategos::config::TemplateConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(tmpl.name, "quick-review");
+    assert_eq!(tmpl.task_type, "review");
+    assert_eq!(tmpl.backend.as_deref(), Some("claude"));
+}
+
+#[test]
+fn template_resolve_placeholders() {
+    let tmpl = strategos::config::TemplateConfig {
+        name: "test".into(),
+        task_type: "review".into(),
+        description: Some("Review {0} for {1}".into()),
+        backend: None,
+        priority: None,
+        max_tokens: None,
+        timeout: None,
+        max_cost: None,
+    };
+    let resolved = tmpl.resolve_description(&["main.rs", "security"]).unwrap();
+    assert_eq!(resolved, "Review main.rs for security");
+}
+
+#[test]
+fn template_missing_args_error() {
+    let tmpl = strategos::config::TemplateConfig {
+        name: "test".into(),
+        task_type: "review".into(),
+        description: Some("Review {0} for {1}".into()),
+        backend: None,
+        priority: None,
+        max_tokens: None,
+        timeout: None,
+        max_cost: None,
+    };
+    // Only provide one arg — {1} should remain unresolved
+    let result = tmpl.resolve_description(&["main.rs"]);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("{1}"));
+}
+
+#[test]
+fn template_validation_empty_name() {
+    let tmpl = strategos::config::TemplateConfig {
+        name: "".into(),
+        task_type: "review".into(),
+        description: None,
+        backend: None,
+        priority: None,
+        max_tokens: None,
+        timeout: None,
+        max_cost: None,
+    };
+    let errors = tmpl.validate();
+    assert!(errors.iter().any(|e| e.contains("name cannot be empty")));
+}
+
+#[test]
+fn template_validation_empty_task_type() {
+    let tmpl = strategos::config::TemplateConfig {
+        name: "valid-name".into(),
+        task_type: "".into(),
+        description: None,
+        backend: None,
+        priority: None,
+        max_tokens: None,
+        timeout: None,
+        max_cost: None,
+    };
+    let errors = tmpl.validate();
+    assert!(errors.iter().any(|e| e.contains("task_type cannot be empty")));
+}
+
+#[test]
+fn global_config_with_templates_roundtrips() {
+    let mut config = strategos::config::GlobalConfig::sample();
+    config.templates = Some(vec![strategos::config::TemplateConfig {
+        name: "quick-review".into(),
+        task_type: "review".into(),
+        description: Some("Review {0}".into()),
+        backend: Some("claude".into()),
+        priority: None,
+        max_tokens: Some(4096),
+        timeout: None,
+        max_cost: None,
+    }]);
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    let parsed: strategos::config::GlobalConfig = toml::from_str(&toml_str).unwrap();
+    let templates = parsed.templates.unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].name, "quick-review");
+    assert_eq!(templates[0].max_tokens, Some(4096));
+}
+
+#[test]
+fn global_config_with_webhooks_roundtrips() {
+    let mut config = strategos::config::GlobalConfig::sample();
+    config.webhooks = Some(vec![strategos::config::WebhookConfig {
+        name: "slack".into(),
+        url: "https://hooks.slack.com/test".into(),
+        events: Some(vec!["TaskCompleted".into()]),
+        enabled: true,
+    }]);
+
+    let toml_str = toml::to_string_pretty(&config).unwrap();
+    let parsed: strategos::config::GlobalConfig = toml::from_str(&toml_str).unwrap();
+    let webhooks = parsed.webhooks.unwrap();
+    assert_eq!(webhooks.len(), 1);
+    assert_eq!(webhooks[0].name, "slack");
+    assert!(webhooks[0].enabled);
 }

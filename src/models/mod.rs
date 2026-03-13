@@ -185,6 +185,19 @@ pub enum PrivacyLevel {
     LocalOnly,
 }
 
+impl Priority {
+    /// Returns a numeric rank for priority ordering (lower = higher priority).
+    /// Critical=0, High=1, Normal=2, Low=3.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Priority::Critical => 0,
+            Priority::High => 1,
+            Priority::Normal => 2,
+            Priority::Low => 3,
+        }
+    }
+}
+
 impl Default for Priority {
     fn default() -> Self {
         Self::Normal

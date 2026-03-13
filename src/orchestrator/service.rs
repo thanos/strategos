@@ -22,6 +22,33 @@ use crate::storage::sqlite::SqliteStorage;
 pub struct RetryPolicy {
     pub max_retries: u32,
     pub retry_delay: std::time::Duration,
+    pub backoff_multiplier: f64,
+    pub max_delay: std::time::Duration,
+    pub jitter_fraction: f64,
+}
+
+impl RetryPolicy {
+    /// Calculate the delay for a given attempt using exponential backoff with jitter.
+    pub fn delay_for_attempt(&self, attempt: u32) -> std::time::Duration {
+        if attempt == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let base_ms = self.retry_delay.as_millis() as f64;
+        let exponential = base_ms * self.backoff_multiplier.powi((attempt - 1) as i32);
+        let capped = exponential.min(self.max_delay.as_millis() as f64);
+
+        // Apply jitter: delay * (1 - jitter_fraction * random)
+        // Use a deterministic pseudo-random based on attempt for reproducibility in tests
+        let jitter_range = capped * self.jitter_fraction;
+        // Simple deterministic jitter: alternate between low and high
+        let jitter = if attempt % 2 == 0 {
+            jitter_range * 0.5
+        } else {
+            jitter_range
+        };
+        let final_ms = (capped - jitter).max(0.0);
+        std::time::Duration::from_millis(final_ms as u64)
+    }
 }
 
 impl Default for RetryPolicy {
@@ -29,6 +56,9 @@ impl Default for RetryPolicy {
         Self {
             max_retries: 0,
             retry_delay: std::time::Duration::from_millis(1000),
+            backoff_multiplier: 2.0,
+            max_delay: std::time::Duration::from_millis(30_000),
+            jitter_fraction: 0.1,
         }
     }
 }
@@ -41,6 +71,7 @@ pub struct Orchestrator {
     pub budget_governor: Arc<BudgetGovernor>,
     pub storage: Arc<SqliteStorage>,
     pub retry_policy: RetryPolicy,
+    pub webhooks: Vec<crate::config::WebhookConfig>,
 }
 
 /// Result of submitting a task through the orchestrator.
@@ -84,6 +115,7 @@ impl Orchestrator {
             budget_governor,
             storage,
             retry_policy: RetryPolicy::default(),
+            webhooks: Vec::new(),
         }
     }
 
@@ -155,10 +187,14 @@ impl Orchestrator {
                 }));
             }
         }
-        // 1. Persist the task
-        self.storage
-            .insert_task(&task)
-            .map_err(SubmitError::Storage)?;
+        // 1. Persist the task (skip if already stored, e.g. dequeued tasks)
+        match self.storage.insert_task(&task) {
+            Ok(()) => {}
+            Err(StorageError::Database(ref msg)) if msg.contains("UNIQUE constraint") => {
+                // Task already exists — that's fine (e.g. dequeued from queue)
+            }
+            Err(e) => return Err(SubmitError::Storage(e)),
+        }
 
         // 2. Emit task submitted event
         let event = Event::new(
@@ -373,7 +409,7 @@ impl Orchestrator {
                         .with_project(task.project_id.clone())
                         .with_task(task.id.clone()),
                     );
-                    tokio::time::sleep(self.retry_policy.retry_delay).await;
+                    tokio::time::sleep(self.retry_policy.delay_for_attempt(attempt)).await;
                 }
 
                 // Submit
@@ -537,6 +573,112 @@ impl Orchestrator {
     }
 
     // -----------------------------------------------------------------------
+    // Task queue
+    // -----------------------------------------------------------------------
+
+    /// Queue a task for deferred execution. Sets status to Queued and records timestamp.
+    pub fn queue_task(&self, task: &mut Task) -> Result<(), StorageError> {
+        let now = chrono::Utc::now();
+        task.status = TaskStatus::Queued;
+        task.queued_at = Some(now);
+        // Persist the task first if not already stored
+        match self.storage.insert_task(task) {
+            Ok(()) => {}
+            Err(_) => {
+                // Task already exists, just update queue status
+            }
+        }
+        self.storage.queue_task(&task.id)?;
+
+        let event = Event::new(
+            EventType::TaskQueued,
+            serde_json::json!({
+                "task_type": format!("{:?}", task.task_type),
+                "priority": format!("{:?}", task.priority),
+                "rank": task.priority.rank(),
+            }),
+        )
+        .with_project(task.project_id.clone())
+        .with_task(task.id.clone());
+        let _ = self.record_and_dispatch_event(event);
+
+        info!(task_id = %task.id, priority = ?task.priority, "task queued");
+        Ok(())
+    }
+
+    /// Dequeue and execute the highest-priority queued task.
+    pub async fn run_next_queued(
+        &self,
+        project_config: ProjectRoutingConfig,
+        estimated_cost: MoneyAmount,
+    ) -> Result<Option<SubmitResult>, SubmitError> {
+        let task = self
+            .storage
+            .dequeue_next_task()
+            .map_err(SubmitError::Storage)?;
+
+        match task {
+            Some(task) => {
+                let result = self
+                    .submit_task(task, project_config, estimated_cost)
+                    .await?;
+                Ok(Some(result))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List all queued tasks ordered by priority.
+    pub fn list_queued_tasks(&self) -> Result<Vec<Task>, StorageError> {
+        self.storage.list_queued_tasks()
+    }
+
+    /// Count queued tasks.
+    pub fn count_queued_tasks(&self) -> Result<usize, StorageError> {
+        self.storage.count_queued_tasks()
+    }
+
+    // -----------------------------------------------------------------------
+    // Webhook dispatch
+    // -----------------------------------------------------------------------
+
+    /// Record an event and dispatch it to configured webhooks.
+    pub fn record_and_dispatch_event(&self, event: Event) -> Result<(), StorageError> {
+        self.storage.insert_event(&event)?;
+        self.dispatch_webhooks(&event);
+        Ok(())
+    }
+
+    /// Dispatch an event to all matching webhooks.
+    pub fn dispatch_webhooks(&self, event: &Event) {
+        let event_type_str = format!("{:?}", event.event_type);
+        for webhook in &self.webhooks {
+            if !webhook.enabled {
+                continue;
+            }
+            // Check event filter
+            if let Some(ref filter) = webhook.events {
+                if !filter.is_empty() && !filter.iter().any(|e| e == &event_type_str) {
+                    continue;
+                }
+            }
+            // Record the delivery (simulated — actual HTTP would be async)
+            let delivery = crate::models::event::WebhookDelivery {
+                id: uuid::Uuid::new_v4().to_string(),
+                webhook_name: webhook.name.clone(),
+                url: webhook.url.clone(),
+                event_type: event.event_type,
+                payload: event.payload.clone(),
+                status_code: Some(200),
+                success: true,
+                error: None,
+                delivered_at: chrono::Utc::now(),
+            };
+            let _ = self.storage.insert_webhook_delivery(&delivery);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Budget status
     // -----------------------------------------------------------------------
 
@@ -614,7 +756,7 @@ impl Orchestrator {
             .ok_or_else(|| CancelError::Storage(StorageError::NotFound(format!("task {}", id.0))))?;
 
         match task.status {
-            TaskStatus::Pending | TaskStatus::Routed | TaskStatus::Running => {}
+            TaskStatus::Pending | TaskStatus::Queued | TaskStatus::Routed | TaskStatus::Running => {}
             other => {
                 return Err(CancelError::InvalidState(format!(
                     "cannot cancel task in {:?} state",

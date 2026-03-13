@@ -18,6 +18,8 @@ pub struct GlobalConfig {
     pub retry_policy: Option<RetryPolicyConfig>,
     pub backends: BackendsConfig,
     pub projects: Vec<ProjectConfig>,
+    pub webhooks: Option<Vec<WebhookConfig>>,
+    pub templates: Option<Vec<TemplateConfig>>,
 }
 
 /// Configuration for automatic retry of transient failures.
@@ -27,6 +29,88 @@ pub struct RetryPolicyConfig {
     pub max_retries: u32,
     /// Delay between retries in milliseconds (default: 1000).
     pub retry_delay_ms: u64,
+    /// Multiplier for exponential backoff (default: 2.0).
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+    /// Maximum delay in milliseconds (default: 30000).
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// Jitter fraction 0.0–1.0 applied to delay (default: 0.1).
+    #[serde(default = "default_jitter_fraction")]
+    pub jitter_fraction: f64,
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_max_delay_ms() -> u64 {
+    30_000
+}
+
+fn default_jitter_fraction() -> f64 {
+    0.1
+}
+
+/// Configuration for a webhook endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    pub name: String,
+    pub url: String,
+    /// Optional list of event types to filter on. If empty/None, all events are sent.
+    pub events: Option<Vec<String>>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Configuration for a task template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateConfig {
+    pub name: String,
+    pub task_type: String,
+    pub description: Option<String>,
+    pub backend: Option<String>,
+    pub priority: Option<String>,
+    pub max_tokens: Option<u64>,
+    pub timeout: Option<u64>,
+    pub max_cost: Option<i64>,
+}
+
+impl TemplateConfig {
+    /// Resolve the template description with placeholder substitution.
+    /// Placeholders are `{0}`, `{1}`, etc. replaced by positional args.
+    pub fn resolve_description(&self, args: &[&str]) -> Result<String, String> {
+        let base = self.description.as_deref().unwrap_or("");
+        let mut result = base.to_string();
+        for (i, arg) in args.iter().enumerate() {
+            let placeholder = format!("{{{}}}", i);
+            result = result.replace(&placeholder, arg);
+        }
+        // Check for unresolved placeholders
+        if let Some(pos) = result.find('{') {
+            if let Some(end) = result[pos..].find('}') {
+                let placeholder = &result[pos..pos + end + 1];
+                return Err(format!("unresolved placeholder: {}", placeholder));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Validate the template config.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.name.is_empty() {
+            errors.push("template name cannot be empty".into());
+        }
+        if self.task_type.is_empty() {
+            errors.push(format!("template '{}': task_type cannot be empty", self.name));
+        }
+        errors
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +375,8 @@ impl GlobalConfig {
                     task_overrides: None,
                 },
             ],
+            webhooks: None,
+            templates: None,
         }
     }
 }

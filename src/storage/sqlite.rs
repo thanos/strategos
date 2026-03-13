@@ -16,7 +16,7 @@ use crate::models::{
     ActionId, BackendId, EventId, MoneyAmount, Priority, PrivacyLevel, ProjectId, TaskId, TaskType,
 };
 
-use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
+use super::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6};
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -120,6 +120,30 @@ impl SqliteStorage {
                 .execute(
                     "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
                     params![4, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 5 {
+            self.conn
+                .execute_batch(SCHEMA_V5)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![5, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+
+        if current_version < 6 {
+            self.conn
+                .execute_batch(SCHEMA_V6)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO _migrations (version, applied_at) VALUES (?1, ?2)",
+                    params![6, Utc::now().to_rfc3339()],
                 )
                 .map_err(|e| StorageError::Database(e.to_string()))?;
         }
@@ -290,11 +314,12 @@ impl SqliteStorage {
         let status_str = serde_json::to_string(&task.status)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         let override_str = task.backend_override.as_ref().map(|b| b.as_str().to_string());
+        let queued_at_str = task.queued_at.map(|dt| dt.to_rfc3339());
 
         self.conn
             .execute(
-                "INSERT INTO tasks (id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO tasks (id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     task.id.0.to_string(),
                     task.project_id.0.to_string(),
@@ -305,6 +330,7 @@ impl SqliteStorage {
                     override_str,
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
+                    queued_at_str,
                 ],
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -315,7 +341,7 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
                  FROM tasks WHERE id = ?1",
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -332,6 +358,7 @@ impl SqliteStorage {
                     backend_override: row.get(6)?,
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
+                    queued_at: row.get(9)?,
                 })
             })
             .optional()
@@ -347,7 +374,7 @@ impl SqliteStorage {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
                  FROM tasks WHERE project_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -364,6 +391,7 @@ impl SqliteStorage {
                     backend_override: row.get(6)?,
                     created_at: row.get(7)?,
                     updated_at: row.get(8)?,
+                    queued_at: row.get(9)?,
                 })
             })
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1157,6 +1185,189 @@ impl SqliteStorage {
     }
 
     // -----------------------------------------------------------------------
+    // Task queue operations
+    // -----------------------------------------------------------------------
+
+    /// Mark a task as queued with current timestamp.
+    pub fn queue_task(&self, task_id: &TaskId) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let status_str = serde_json::to_string(&TaskStatus::Queued)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = ?1, queued_at = ?2, updated_at = ?3 WHERE id = ?4",
+                params![status_str, now, now, task_id.0.to_string()],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if affected == 0 {
+            return Err(StorageError::NotFound(format!("task {}", task_id.0)));
+        }
+        Ok(())
+    }
+
+    /// List all queued tasks, ordered by priority rank (ascending) then queued_at.
+    pub fn list_queued_tasks(&self) -> Result<Vec<Task>, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Queued)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, task_type, description, priority, status, backend_override, created_at, updated_at, queued_at
+                 FROM tasks WHERE status = ?1 ORDER BY priority ASC, queued_at ASC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![status_str], |row| {
+                Ok(TaskRow {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    task_type: row.get(2)?,
+                    description: row.get(3)?,
+                    priority: row.get(4)?,
+                    status: row.get(5)?,
+                    backend_override: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    queued_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut tasks: Vec<Task> = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            tasks.push(row.into_task()?);
+        }
+        // Sort by priority rank then queued_at (SQLite sorts priority as JSON strings,
+        // so we re-sort in Rust for correct numeric ordering)
+        tasks.sort_by(|a, b| {
+            a.priority
+                .rank()
+                .cmp(&b.priority.rank())
+                .then_with(|| a.queued_at.cmp(&b.queued_at))
+        });
+        Ok(tasks)
+    }
+
+    /// Dequeue the highest-priority queued task (lowest rank, earliest queued_at).
+    /// Returns the task and updates its status to Pending for processing.
+    pub fn dequeue_next_task(&self) -> Result<Option<Task>, StorageError> {
+        let queued = self.list_queued_tasks()?;
+        if let Some(task) = queued.into_iter().next() {
+            self.update_task_status(&task.id, TaskStatus::Pending)?;
+            // Re-fetch to get updated status
+            self.get_task(&task.id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count queued tasks.
+    pub fn count_queued_tasks(&self) -> Result<usize, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Queued)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = ?1",
+                params![status_str],
+                |row| row.get(0),
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(count as usize)
+    }
+
+    // -----------------------------------------------------------------------
+    // Webhook deliveries
+    // -----------------------------------------------------------------------
+
+    /// Insert a webhook delivery record.
+    pub fn insert_webhook_delivery(
+        &self,
+        delivery: &crate::models::event::WebhookDelivery,
+    ) -> Result<(), StorageError> {
+        let event_type_str = serde_json::to_string(&delivery.event_type)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let payload_str = serde_json::to_string(&delivery.payload)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO webhook_deliveries (id, webhook_name, url, event_type, payload, status_code, success, error, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    delivery.id,
+                    delivery.webhook_name,
+                    delivery.url,
+                    event_type_str,
+                    payload_str,
+                    delivery.status_code.map(|c| c as i64),
+                    delivery.success as i64,
+                    delivery.error,
+                    delivery.delivered_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List webhook deliveries, most recent first.
+    pub fn list_webhook_deliveries(&self, limit: usize) -> Result<Vec<crate::models::event::WebhookDelivery>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, webhook_name, url, event_type, payload, status_code, success, error, delivered_at
+                 FROM webhook_deliveries ORDER BY delivered_at DESC LIMIT ?1",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut deliveries = Vec::new();
+        for row in rows {
+            let (id, webhook_name, url, event_type_str, payload_str, status_code, success, error, delivered_at) =
+                row.map_err(|e| StorageError::Database(e.to_string()))?;
+            let event_type: EventType = serde_json::from_str(&event_type_str)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let payload: serde_json::Value = match payload_str {
+                Some(ref s) => serde_json::from_str(s)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                None => serde_json::Value::Null,
+            };
+            let delivered_at = chrono::DateTime::parse_from_rfc3339(&delivered_at)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?
+                .with_timezone(&Utc);
+            deliveries.push(crate::models::event::WebhookDelivery {
+                id,
+                webhook_name,
+                url,
+                event_type,
+                payload,
+                status_code: status_code.map(|c| c as u16),
+                success: success != 0,
+                error,
+                delivered_at,
+            });
+        }
+        Ok(deliveries)
+    }
+
+    // -----------------------------------------------------------------------
     // Event filtering
     // -----------------------------------------------------------------------
 
@@ -1667,6 +1878,7 @@ struct TaskRow {
     backend_override: Option<String>,
     created_at: String,
     updated_at: String,
+    queued_at: Option<String>,
 }
 
 impl TaskRow {
@@ -1688,6 +1900,14 @@ impl TaskRow {
         let updated_at = chrono::DateTime::parse_from_rfc3339(&self.updated_at)
             .map_err(|e| StorageError::Serialization(e.to_string()))?
             .with_timezone(&Utc);
+        let queued_at = self
+            .queued_at
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| StorageError::Serialization(e.to_string()))
+            })
+            .transpose()?;
 
         Ok(Task {
             id: TaskId(id),
@@ -1699,6 +1919,7 @@ impl TaskRow {
             backend_override,
             created_at,
             updated_at,
+            queued_at,
         })
     }
 }
@@ -2149,13 +2370,13 @@ mod tests {
     fn schema_v2_migration_creates_indexes() {
         let storage = SqliteStorage::in_memory().unwrap();
 
-        // Verify migration version is 4 (V1 + V2 indexes + V3 task_outputs + V4 task_dependencies)
+        // Verify migration version is 6 (V1-V6)
         let version: i64 = storage.conn.query_row(
             "SELECT MAX(version) FROM _migrations",
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 6);
 
         // Verify indexes exist
         let index_count: i64 = storage.conn.query_row(

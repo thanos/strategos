@@ -6,6 +6,7 @@ use super::{BackendId, Priority, ProjectId, TaskId, TaskType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskStatus {
     Pending,
+    Queued,
     Routed,
     Running,
     Completed,
@@ -24,6 +25,7 @@ pub struct Task {
     pub backend_override: Option<BackendId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub queued_at: Option<DateTime<Utc>>,
 }
 
 impl Task {
@@ -43,6 +45,7 @@ impl Task {
             backend_override: None,
             created_at: now,
             updated_at: now,
+            queued_at: None,
         }
     }
 }
