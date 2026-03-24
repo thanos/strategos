@@ -5,11 +5,13 @@ edition = "2024"
 description = "Command-line orchestration system for AI-assisted software development"
 
 [dependencies]
-async-trait = "0.1"
 anyhow = "1"
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
 indexmap = { version = "2", features = ["serde"] }
+ratatui = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
