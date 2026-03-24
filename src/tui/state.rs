@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use crate::models::BackendId;
 use crate::tui::domain::ActionItem;
 use crate::tui::domain::{BudgetState, ProjectState, RoutingState};
 use crate::tui::feed::{FeedFilter, FeedItem};
@@ -75,18 +74,12 @@ impl AppState {
             return Vec::new();
         };
 
+        let pending_counts = storage.count_pending_tasks_by_project().unwrap_or_default();
+
         projects
             .into_iter()
             .map(|p| {
-                let pending = storage
-                    .list_tasks_by_project(&p.id)
-                    .map(|tasks| {
-                        tasks
-                            .iter()
-                            .filter(|t| t.status == crate::models::task::TaskStatus::Pending)
-                            .count()
-                    })
-                    .unwrap_or(0);
+                let pending = pending_counts.get(&p.id).copied().unwrap_or(0);
 
                 ProjectState {
                     id: p.id.clone(),

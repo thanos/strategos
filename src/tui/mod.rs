@@ -1,12 +1,13 @@
 mod app;
-mod domain;
-mod event;
-mod feed;
-mod state;
 mod terminal;
-mod update;
 mod views;
 mod widgets;
+
+pub mod domain;
+pub mod event;
+pub mod feed;
+pub mod state;
+pub mod update;
 
 pub use app::run_tui;
 

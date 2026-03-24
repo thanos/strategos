@@ -6,7 +6,9 @@ use ratatui::{
 };
 
 use crate::tui::state::AppState;
-use crate::tui::{types::FocusRegion, SIDEBAR_WIDTH};
+use crate::tui::types::FocusRegion;
+use crate::tui::update::FILTERS;
+use crate::tui::SIDEBAR_WIDTH;
 
 pub fn render_sidebar(f: &mut Frame, area: Rect, state: &mut AppState) {
     let tabs = ["Chats", "Projects", "Queue", "Budget", "Events"];
@@ -89,20 +91,10 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, state: &mut AppState) {
     );
 
     let filters_start_y = projects_start_y + projects_height + 1;
-    let filters = [
-        "all",
-        "needs_reply",
-        "review",
-        "commit",
-        "blocked",
-        "budget",
-        "unread",
-    ];
-
-    let filter_items: Vec<ListItem> = filters
+    let filter_items: Vec<ListItem> = FILTERS
         .iter()
         .enumerate()
-        .map(|(i, &name)| {
+        .map(|(i, filter)| {
             let selected = i == state.chats_view.selected_filter_index;
             let style = if selected {
                 Style::default().add_modifier(Modifier::BOLD)
@@ -111,7 +103,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, state: &mut AppState) {
             };
             let prefix = if selected { "[" } else { " " };
             let suffix = if selected { "]" } else { "" };
-            ListItem::new(format!("{}{}{}", prefix, name, suffix)).style(style)
+            ListItem::new(format!("{}{}{}", prefix, filter.as_str(), suffix)).style(style)
         })
         .collect();
 
@@ -121,7 +113,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, state: &mut AppState) {
         Style::default().add_modifier(Modifier::DIM)
     });
 
-    let filters_height = (filters.len() + 1) as u16;
+    let filters_height = (FILTERS.len() + 1) as u16;
     f.render_widget(
         filters_list,
         Rect::new(

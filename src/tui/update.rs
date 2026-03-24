@@ -1,13 +1,26 @@
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 
 use crate::tui::event::{Effect, UiEvent};
+use crate::tui::feed::FeedFilter;
 use crate::tui::state::AppState;
 use crate::tui::types::{FocusRegion, TopLevelTab, UiMode};
 use crate::tui::views;
 use crate::tui::widgets::{self, sidebar::render_sidebar};
 
-pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
+pub const FILTERS: &[FeedFilter] = &[
+    FeedFilter::All,
+    FeedFilter::NeedsReply,
+    FeedFilter::Review,
+    FeedFilter::Commit,
+    FeedFilter::Blocked,
+    FeedFilter::Budget,
+    FeedFilter::Unread,
+];
+
+const REFRESH_INTERVAL_TICKS: u32 = 40;
+
+pub fn update(state: &mut AppState, event: UiEvent, tick_count: &mut u32) -> Vec<Effect> {
     let mut effects = Vec::new();
 
     match event {
@@ -33,7 +46,11 @@ pub fn update(state: &mut AppState, event: UiEvent) -> Vec<Effect> {
             }
         }
         UiEvent::Tick => {
-            effects.push(Effect::RefreshState);
+            *tick_count += 1;
+            if *tick_count >= REFRESH_INTERVAL_TICKS {
+                *tick_count = 0;
+                effects.push(Effect::RefreshState);
+            }
         }
         UiEvent::Resize(_, _) => {}
         UiEvent::ErrorOccurred(msg) => {
@@ -92,9 +109,9 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Filters => {
-                let filter_count = 7;
-                if state.chats_view.selected_filter_index < filter_count - 1 {
+                if state.chats_view.selected_filter_index < FILTERS.len() - 1 {
                     state.chats_view.selected_filter_index += 1;
+                    update_active_filter(state);
                 }
             }
             FocusRegion::Feed => {
@@ -114,6 +131,7 @@ fn handle_normal_mode(
             FocusRegion::Filters => {
                 if state.chats_view.selected_filter_index > 0 {
                     state.chats_view.selected_filter_index -= 1;
+                    update_active_filter(state);
                 }
             }
             FocusRegion::Feed => {
@@ -139,6 +157,12 @@ fn handle_normal_mode(
     }
 }
 
+fn update_active_filter(state: &mut AppState) {
+    if let Some(filter) = FILTERS.get(state.chats_view.selected_filter_index) {
+        state.chats_view.active_filter = filter.clone();
+    }
+}
+
 fn handle_input_mode(
     state: &mut AppState,
     key: crossterm::event::KeyEvent,
@@ -148,12 +172,16 @@ fn handle_input_mode(
         KeyCode::Esc => {
             state.mode = UiMode::Normal;
             state.composer.input.clear();
+            state.composer.cursor_position = 0;
+            state.composer.history_index = None;
         }
         KeyCode::Enter => {
             if !state.composer.input.is_empty() {
                 let input = state.composer.input.clone();
                 state.composer.history.push(input.clone());
                 state.composer.input.clear();
+                state.composer.cursor_position = 0;
+                state.composer.history_index = None;
                 state.mode = UiMode::Normal;
 
                 if let Some((project, description)) = parse_composer_input(&input, state) {
@@ -166,12 +194,22 @@ fn handle_input_mode(
         }
         KeyCode::Char(c) => {
             state.composer.input.push(c);
-            state.composer.cursor_position += 1;
+            state.composer.cursor_position = state.composer.input.chars().count();
         }
         KeyCode::Backspace => {
-            if state.composer.cursor_position > 0 {
-                state.composer.cursor_position -= 1;
-                state.composer.input.remove(state.composer.cursor_position);
+            if !state.composer.input.is_empty() {
+                let char_count = state.composer.input.chars().count();
+                if char_count > 0 {
+                    let byte_index = state
+                        .composer
+                        .input
+                        .char_indices()
+                        .nth(char_count - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.composer.input.truncate(byte_index);
+                    state.composer.cursor_position = char_count - 1;
+                }
             }
         }
         KeyCode::Up => {
@@ -183,6 +221,7 @@ fn handle_input_mode(
                 if idx > 0 {
                     state.composer.history_index = Some(idx - 1);
                     state.composer.input = state.composer.history[idx - 1].clone();
+                    state.composer.cursor_position = state.composer.input.chars().count();
                 }
             }
         }
@@ -191,9 +230,11 @@ fn handle_input_mode(
                 if idx < state.composer.history.len() - 1 {
                     state.composer.history_index = Some(idx + 1);
                     state.composer.input = state.composer.history[idx + 1].clone();
+                    state.composer.cursor_position = state.composer.input.chars().count();
                 } else {
                     state.composer.history_index = None;
                     state.composer.input.clear();
+                    state.composer.cursor_position = 0;
                 }
             }
         }

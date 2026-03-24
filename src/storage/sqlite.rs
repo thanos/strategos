@@ -1541,6 +1541,32 @@ impl SqliteStorage {
         Ok(count as u32)
     }
 
+    /// Count pending tasks grouped by project.
+    pub fn count_pending_tasks_by_project(&self) -> Result<std::collections::HashMap<ProjectId, usize>, StorageError> {
+        let status_str = serde_json::to_string(&TaskStatus::Pending)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project_id, COUNT(*) FROM tasks WHERE status = ?1 GROUP BY project_id")
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![status_str], |row| {
+                let project_id: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((ProjectId(uuid::Uuid::parse_str(&project_id).unwrap_or(uuid::Uuid::nil())), count as usize))
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let (project_id, count) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            counts.insert(project_id, count);
+        }
+        Ok(counts)
+    }
+
     /// Count currently running tasks for a specific backend (via routing_history).
     pub fn count_running_tasks_for_backend(&self, backend_id: &str) -> Result<u32, StorageError> {
         let status_str = serde_json::to_string(&TaskStatus::Running)

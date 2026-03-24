@@ -23,6 +23,28 @@ pub fn restore() -> io::Result<()> {
     Ok(())
 }
 
-pub fn restore_on_panic() {
-    let _ = restore();
+pub struct PanicGuard;
+
+impl PanicGuard {
+    pub fn new() -> Self {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            prev_hook(info);
+        }));
+        Self
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        let _ = restore();
+    }
+}
+
+impl Default for PanicGuard {
+    fn default() -> Self {
+        Self::new()
+    }
 }
