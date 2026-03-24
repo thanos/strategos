@@ -1,4 +1,5 @@
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent};
+use futures::StreamExt;
 
 use crate::models::{ActionId, ProjectId};
 use crate::tui::feed::FeedItemId;
@@ -42,24 +43,34 @@ pub enum EventResult {
 }
 
 pub async fn collect_events(tx: tokio::sync::mpsc::Sender<UiEvent>, tick_rate: std::time::Duration) {
-    use crossterm::event::{Event, poll};
-    
+    let mut reader = EventStream::new();
+    let mut interval = tokio::time::interval(tick_rate);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
-        if poll(tick_rate).unwrap_or(false) {
-            if let Ok(event) = crossterm::event::read() {
-                let ui_event = match event {
-                    Event::Key(key) => UiEvent::Key(key),
-                    Event::Mouse(mouse) => UiEvent::Mouse(mouse),
-                    Event::Resize(cols, rows) => UiEvent::Resize(cols, rows),
-                    _ => continue,
-                };
-                if tx.send(ui_event).await.is_err() {
+        tokio::select! {
+            _ = interval.tick() => {
+                if tx.send(UiEvent::Tick).await.is_err() {
                     break;
                 }
             }
-        } else {
-            if tx.send(UiEvent::Tick).await.is_err() {
-                break;
+            maybe_event = reader.next() => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        let ui_event = match event {
+                            Event::Key(key) => UiEvent::Key(key),
+                            Event::Mouse(mouse) => UiEvent::Mouse(mouse),
+                            Event::Resize(cols, rows) => UiEvent::Resize(cols, rows),
+                            _ => continue,
+                        };
+                        if tx.send(ui_event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        break;
+                    }
+                }
             }
         }
     }
