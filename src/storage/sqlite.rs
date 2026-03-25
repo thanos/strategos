@@ -2750,4 +2750,48 @@ mod tests {
         let count = storage.count_pending_actions_for_project(&project.id).unwrap();
         assert_eq!(count, 0);
     }
+
+    #[test]
+    fn count_pending_tasks_by_project_groups_correctly() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let p1 = Project::new("p1", "/tmp/p1");
+        let p2 = Project::new("p2", "/tmp/p2");
+        storage.insert_project(&p1).unwrap();
+        storage.insert_project(&p2).unwrap();
+
+        // Create tasks with different statuses and projects
+        let t1 = Task::new(p1.id.clone(), TaskType::Planning, "p1 pending 1");
+        let t2 = Task::new(p1.id.clone(), TaskType::Planning, "p1 pending 2");
+        let t3 = Task::new(p1.id.clone(), TaskType::Planning, "p1 completed");
+        let t4 = Task::new(p2.id.clone(), TaskType::Planning, "p2 pending");
+        let t5 = Task::new(p2.id.clone(), TaskType::Planning, "p2 running");
+
+        storage.insert_task(&t1).unwrap();
+        storage.insert_task(&t2).unwrap();
+        storage.insert_task(&t3).unwrap();
+        storage.insert_task(&t4).unwrap();
+        storage.insert_task(&t5).unwrap();
+
+        // Update statuses
+        storage.update_task_status(&t3.id, TaskStatus::Completed).unwrap();
+        storage.update_task_status(&t5.id, TaskStatus::Running).unwrap();
+
+        // Get counts
+        let counts = storage.count_pending_tasks_by_project().unwrap();
+
+        // p1 should have 2 pending (t1, t2), p2 should have 1 pending (t4)
+        assert_eq!(counts.get(&p1.id), Some(&2));
+        assert_eq!(counts.get(&p2.id), Some(&1));
+
+        // Total pending tasks
+        let total: usize = counts.values().sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn count_pending_tasks_by_project_empty() {
+        let storage = SqliteStorage::in_memory().unwrap();
+        let counts = storage.count_pending_tasks_by_project().unwrap();
+        assert!(counts.is_empty());
+    }
 }

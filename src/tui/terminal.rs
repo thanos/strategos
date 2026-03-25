@@ -13,6 +13,7 @@ pub type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 static TERMINAL_RESTORED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() -> io::Result<TuiTerminal> {
+    TERMINAL_RESTORED.store(false, Ordering::SeqCst);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
