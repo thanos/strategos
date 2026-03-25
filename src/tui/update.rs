@@ -26,7 +26,12 @@ pub fn update(state: &mut AppState, event: UiEvent, tick_count: &mut u32) -> Vec
     match event {
         UiEvent::Key(key) => {
             if state.show_help {
-                state.show_help = false;
+                match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc => {
+                        state.show_help = false;
+                    }
+                    _ => {}
+                }
                 return effects;
             }
 

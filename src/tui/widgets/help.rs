@@ -31,7 +31,7 @@ Composer:
   Enter    Send message
   Esc      Clear/close
 
-Press ? to close help
+Press ? or Esc to close help
 "#;
 
     let block = Block::default()

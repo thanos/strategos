@@ -69,6 +69,14 @@ impl AppState {
         }
     }
 
+    pub fn refresh_from_storage(&mut self, storage: &crate::storage::sqlite::SqliteStorage) {
+        self.projects = Self::load_projects(storage);
+        self.feed = crate::tui::feed::feed_items_from_storage(storage);
+        self.actions = Self::load_actions(storage);
+        self.budget = Self::load_budget(storage);
+        self.events = Self::load_events(storage);
+    }
+
     fn load_projects(storage: &crate::storage::sqlite::SqliteStorage) -> Vec<ProjectState> {
         let Ok(projects) = storage.list_projects() else {
             return Vec::new();

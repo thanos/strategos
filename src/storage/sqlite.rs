@@ -1555,14 +1555,21 @@ impl SqliteStorage {
             .query_map(params![status_str], |row| {
                 let project_id: String = row.get(0)?;
                 let count: i64 = row.get(1)?;
-                Ok((ProjectId(uuid::Uuid::parse_str(&project_id).unwrap_or(uuid::Uuid::nil())), count as usize))
+                Ok((project_id, count as usize))
             })
             .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let mut counts = std::collections::HashMap::new();
         for row in rows {
-            let (project_id, count) = row.map_err(|e| StorageError::Database(e.to_string()))?;
-            counts.insert(project_id, count);
+            let (project_id_str, count) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            match uuid::Uuid::parse_str(&project_id_str) {
+                Ok(uuid) => {
+                    counts.insert(ProjectId(uuid), count);
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping task with invalid project_id '{}': {}", project_id_str, e);
+                }
+            }
         }
         Ok(counts)
     }

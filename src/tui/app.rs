@@ -38,7 +38,7 @@ pub async fn run_tui(config: GlobalConfig) -> anyhow::Result<()> {
                             app_state.should_quit = true;
                         }
                         crate::tui::event::Effect::RefreshState => {
-                            app_state = AppState::load_from_storage(&storage);
+                            app_state.refresh_from_storage(&storage);
                         }
                         crate::tui::event::Effect::ShowError(msg) => {
                             app_state.error_message = Some(msg);

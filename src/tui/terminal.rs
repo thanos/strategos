@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -9,6 +10,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 pub type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+static TERMINAL_RESTORED: AtomicBool = AtomicBool::new(false);
+
 pub fn init() -> io::Result<TuiTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -18,6 +21,9 @@ pub fn init() -> io::Result<TuiTerminal> {
 }
 
 pub fn restore() -> io::Result<()> {
+    if TERMINAL_RESTORED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
@@ -29,8 +35,10 @@ impl PanicGuard {
     pub fn new() -> Self {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            if !TERMINAL_RESTORED.swap(true, Ordering::SeqCst) {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            }
             prev_hook(info);
         }));
         Self

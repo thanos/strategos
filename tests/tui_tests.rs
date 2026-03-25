@@ -42,6 +42,52 @@ fn test_help_toggle() {
 }
 
 #[test]
+fn test_help_closes_on_esc() {
+    let mut state = create_test_state();
+    let mut tick_count = 0;
+
+    let question = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let esc = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    update(&mut state, UiEvent::Key(question), &mut tick_count);
+    assert!(state.show_help);
+
+    update(&mut state, UiEvent::Key(esc), &mut tick_count);
+    assert!(!state.show_help);
+}
+
+#[test]
+fn test_help_ignores_other_keys() {
+    let mut state = create_test_state();
+    let mut tick_count = 0;
+
+    let question = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let other_key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('j'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    update(&mut state, UiEvent::Key(question), &mut tick_count);
+    assert!(state.show_help);
+
+    // Other keys should be ignored while help is open
+    update(&mut state, UiEvent::Key(other_key), &mut tick_count);
+    assert!(state.show_help);
+
+    // Selected index should not change
+    assert_eq!(state.chats_view.selected_feed_index, 0);
+}
+
+#[test]
 fn test_tab_switching() {
     let mut state = create_test_state();
     let mut tick_count = 0;
