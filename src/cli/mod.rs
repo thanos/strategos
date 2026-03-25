@@ -210,6 +210,9 @@ pub enum Commands {
 
     /// Show current configuration
     Config,
+
+    /// Launch interactive terminal UI
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -517,6 +520,7 @@ pub async fn run_with(cli: ParsedCli, config: GlobalConfig) -> Result<()> {
         Commands::Webhooks(sub) => cmd_webhooks(sub, &config),
         Commands::Templates(sub) => cmd_templates(sub, &config),
         Commands::Config => cmd_config(&config, &cli.config_path),
+        Commands::Tui => cmd_tui(&config).await,
     }
 }
 
@@ -2127,6 +2131,10 @@ fn cmd_config(config: &GlobalConfig, config_path: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn cmd_tui(config: &GlobalConfig) -> Result<()> {
+    crate::tui::run_tui(config.clone()).await
 }
 
 // ---------------------------------------------------------------------------

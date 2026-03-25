@@ -7,3 +7,4 @@ pub mod models;
 pub mod orchestrator;
 pub mod routing;
 pub mod storage;
+pub mod tui;
