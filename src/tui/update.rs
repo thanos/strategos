@@ -2,7 +2,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 
 use crate::tui::event::{Effect, UiEvent};
-use crate::tui::feed::FeedFilter;
+use crate::tui::feed::{FeedFilter, FeedItem, FeedItemId};
 use crate::tui::state::AppState;
 use crate::tui::types::{FocusRegion, TopLevelTab, UiMode};
 use crate::tui::views;
@@ -70,6 +70,22 @@ pub fn update(state: &mut AppState, event: UiEvent, tick_count: &mut u32) -> Vec
     effects
 }
 
+fn get_filtered_feed<'a>(state: &'a AppState) -> Vec<&'a FeedItem> {
+    state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item))
+        .collect()
+}
+
+fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> usize {
+    state
+        .chats_view
+        .selected_feed_id
+        .and_then(|id| filtered.iter().position(|item| item.id == id))
+        .unwrap_or(0)
+}
+
 fn handle_normal_mode(
     state: &mut AppState,
     key: crossterm::event::KeyEvent,
@@ -120,9 +136,15 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                let feed_len = state.feed.len();
-                if feed_len > 0 && state.chats_view.selected_feed_index < feed_len - 1 {
-                    state.chats_view.selected_feed_index += 1;
+                let filtered = get_filtered_feed(state);
+                if filtered.is_empty() {
+                    state.chats_view.selected_feed_id = None;
+                } else if state.chats_view.selected_feed_id.is_none() {
+                    state.chats_view.selected_feed_id = Some(filtered[0].id);
+                } else {
+                    let current_idx = resolve_feed_index(state, &filtered);
+                    let new_idx = (current_idx + 1).min(filtered.len() - 1);
+                    state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
                 }
             }
             _ => {}
@@ -140,8 +162,15 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                if state.chats_view.selected_feed_index > 0 {
-                    state.chats_view.selected_feed_index -= 1;
+                let filtered = get_filtered_feed(state);
+                if filtered.is_empty() {
+                    state.chats_view.selected_feed_id = None;
+                } else if state.chats_view.selected_feed_id.is_none() {
+                    state.chats_view.selected_feed_id = Some(filtered[0].id);
+                } else {
+                    let current_idx = resolve_feed_index(state, &filtered);
+                    let new_idx = current_idx.saturating_sub(1);
+                    state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
                 }
             }
             _ => {}
@@ -189,11 +218,18 @@ fn handle_input_mode(
                 state.composer.history_index = None;
                 state.mode = UiMode::Normal;
 
-                if let Some((project, description)) = parse_composer_input(&input, state) {
-                    effects.push(Effect::SubmitTask {
-                        project,
-                        description,
-                    });
+                match parse_composer_input(&input, state) {
+                    Some((project, description)) => {
+                        effects.push(Effect::SubmitTask {
+                            project,
+                            description,
+                        });
+                    }
+                    None => {
+                        effects.push(Effect::ShowError(
+                            "No project context available. Select a project or use 'project_name message' format.".to_string()
+                        ));
+                    }
                 }
             }
         }
@@ -273,22 +309,25 @@ fn parse_composer_input(
     input: &str,
     state: &AppState,
 ) -> Option<(crate::models::ProjectId, String)> {
-    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-    if parts.len() < 2 {
-        return None;
+    // Try to find an explicit project prefix (word followed by space)
+    if let Some(space_pos) = input.find(' ') {
+        let potential_project = &input[..space_pos];
+        let description = input[space_pos + 1..].to_string();
+
+        // Check if first word matches a project name
+        if let Some(project) = state.projects.iter().find(|p| p.name == potential_project) {
+            return Some((project.id.clone(), description));
+        }
     }
 
-    let potential_project = parts[0];
-    let description = parts[1].to_string();
-
-    if let Some(project) = state.projects.iter().find(|p| p.name == potential_project) {
-        return Some((project.id.clone(), description));
+    // Fallback 1: Route to selected feed item's project
+    if let Some(selected_id) = state.chats_view.selected_feed_id {
+        if let Some(item) = state.feed.iter().find(|i| i.id == selected_id) {
+            return Some((item.project_id.clone(), input.to_string()));
+        }
     }
 
-    if let Some(item) = state.feed.get(state.chats_view.selected_feed_index) {
-        return Some((item.project_id.clone(), input.to_string()));
-    }
-
+    // Fallback 2: Route to selected project in sidebar
     if let Some(project) = state.projects.get(state.chats_view.selected_project_index) {
         return Some((project.id.clone(), input.to_string()));
     }

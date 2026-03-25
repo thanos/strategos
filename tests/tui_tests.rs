@@ -83,8 +83,8 @@ fn test_help_ignores_other_keys() {
     update(&mut state, UiEvent::Key(other_key), &mut tick_count);
     assert!(state.show_help);
 
-    // Selected index should not change
-    assert_eq!(state.chats_view.selected_feed_index, 0);
+    // Selected feed ID should not change (should remain None since no feed items)
+    assert!(state.chats_view.selected_feed_id.is_none());
 }
 
 #[test]
@@ -330,4 +330,158 @@ fn test_throttled_refresh() {
     let effects = update(&mut state, UiEvent::Tick, &mut tick_count);
     assert!(effects.iter().any(|e| matches!(e, Effect::RefreshState)));
     assert_eq!(tick_count, 0);
+}
+
+#[test]
+fn test_feed_selection_persists_across_filter_change() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    let project_id = ProjectId::new();
+
+    state.feed = vec![
+        FeedItem {
+            id: FeedItemId::new(),
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review item".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: FeedItemId::new(),
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::Update,
+            summary: "update item".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: false,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+    ];
+
+    // Select the review item while filter is All
+    state.chats_view.active_filter = FeedFilter::All;
+    state.chats_view.selected_feed_id = Some(state.feed[0].id);
+
+    // Change filter to Review - selection should persist
+    state.chats_view.active_filter = FeedFilter::Review;
+
+    // The selection should still point to the review item
+    assert_eq!(state.chats_view.selected_feed_id, Some(state.feed[0].id));
+}
+
+#[test]
+fn test_feed_navigation_respects_active_filter() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
+    let project_id = ProjectId::new();
+
+    let id1 = FeedItemId::new();
+    let id2 = FeedItemId::new();
+    let id3 = FeedItemId::new();
+
+    state.feed = vec![
+        FeedItem {
+            id: id1,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review 1".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: id2,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::Update,
+            summary: "update 1".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: false,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: id3,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review 2".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+    ];
+
+    // Filter to only show Review items
+    state.chats_view.active_filter = FeedFilter::Review;
+
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Should select first review item
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(id1));
+
+    // Should skip update item and go to second review item
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(id3));
+}
+
+#[test]
+fn test_feed_selection_clamped_on_empty_filter() {
+    let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
+    state.feed = vec![];
+    state.chats_view.selected_feed_id = None;
+
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Should handle gracefully without panic
+    update(&mut state, UiEvent::Key(down), &mut tick_count);
+    assert!(state.chats_view.selected_feed_id.is_none());
 }
