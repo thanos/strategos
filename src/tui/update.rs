@@ -2,7 +2,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 
 use crate::tui::event::{Effect, UiEvent};
-use crate::tui::feed::{FeedFilter, FeedItem, FeedItemId};
+use crate::tui::feed::{FeedFilter, FeedItem};
 use crate::tui::state::AppState;
 use crate::tui::types::{FocusRegion, TopLevelTab, UiMode};
 use crate::tui::views;
@@ -78,12 +78,11 @@ fn get_filtered_feed<'a>(state: &'a AppState) -> Vec<&'a FeedItem> {
         .collect()
 }
 
-fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> usize {
+fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> Option<usize> {
     state
         .chats_view
         .selected_feed_id
         .and_then(|id| filtered.iter().position(|item| item.id == id))
-        .unwrap_or(0)
 }
 
 fn handle_normal_mode(
@@ -139,11 +138,12 @@ fn handle_normal_mode(
                 let filtered = get_filtered_feed(state);
                 if filtered.is_empty() {
                     state.chats_view.selected_feed_id = None;
-                } else if state.chats_view.selected_feed_id.is_none() {
-                    state.chats_view.selected_feed_id = Some(filtered[0].id);
                 } else {
                     let current_idx = resolve_feed_index(state, &filtered);
-                    let new_idx = (current_idx + 1).min(filtered.len() - 1);
+                    let new_idx = match current_idx {
+                        Some(idx) => (idx + 1).min(filtered.len() - 1),
+                        None => 0,
+                    };
                     state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
                 }
             }
@@ -165,11 +165,12 @@ fn handle_normal_mode(
                 let filtered = get_filtered_feed(state);
                 if filtered.is_empty() {
                     state.chats_view.selected_feed_id = None;
-                } else if state.chats_view.selected_feed_id.is_none() {
-                    state.chats_view.selected_feed_id = Some(filtered[0].id);
                 } else {
                     let current_idx = resolve_feed_index(state, &filtered);
-                    let new_idx = current_idx.saturating_sub(1);
+                    let new_idx = match current_idx {
+                        Some(idx) => idx.saturating_sub(1),
+                        None => 0,
+                    };
                     state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
                 }
             }

@@ -7,7 +7,7 @@ use ratatui::{
 
 use crate::tui::state::AppState;
 
-pub fn render_feed(f: &mut Frame, area: Rect, state: &mut AppState) {
+pub fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
     let filtered: Vec<_> = state
         .feed
         .iter()
@@ -15,25 +15,19 @@ pub fn render_feed(f: &mut Frame, area: Rect, state: &mut AppState) {
         .collect();
 
     if filtered.is_empty() {
-        state.chats_view.selected_feed_id = None;
         let empty = ratatui::widgets::Paragraph::new("No items")
             .style(Style::default().add_modifier(Modifier::DIM));
         f.render_widget(empty, area);
         return;
     }
 
-    // Resolve ID to filtered index
+    // Resolve ID to filtered index, default to 0 if not found
     let selected_idx = state
         .chats_view
         .selected_feed_id
         .and_then(|id| filtered.iter().position(|item| item.id == id))
-        .unwrap_or(0);
-
-    // Clamp selection if ID not found or out of bounds
-    let selected_idx = selected_idx.min(filtered.len() - 1);
-
-    // Update state with resolved ID (in case it was clamped)
-    state.chats_view.selected_feed_id = Some(filtered[selected_idx].id);
+        .unwrap_or(0)
+        .min(filtered.len() - 1);
 
     let items: Vec<ListItem> = filtered
         .iter()

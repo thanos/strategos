@@ -338,11 +338,15 @@ fn test_feed_selection_persists_across_filter_change() {
     use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
 
     let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
     let project_id = ProjectId::new();
+
+    let review_id = FeedItemId::new();
+    let update_id = FeedItemId::new();
 
     state.feed = vec![
         FeedItem {
-            id: FeedItemId::new(),
+            id: review_id,
             project_id: project_id.clone(),
             project_name: "test".to_string(),
             kind: FeedItemKind::ReviewRequest,
@@ -358,7 +362,7 @@ fn test_feed_selection_persists_across_filter_change() {
             linked_event_ids: vec![],
         },
         FeedItem {
-            id: FeedItemId::new(),
+            id: update_id,
             project_id: project_id.clone(),
             project_name: "test".to_string(),
             kind: FeedItemKind::Update,
@@ -375,15 +379,51 @@ fn test_feed_selection_persists_across_filter_change() {
         },
     ];
 
-    // Select the review item while filter is All
-    state.chats_view.active_filter = FeedFilter::All;
-    state.chats_view.selected_feed_id = Some(state.feed[0].id);
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
 
-    // Change filter to Review - selection should persist
-    state.chats_view.active_filter = FeedFilter::Review;
+    // Filter is All by default, navigate to select the review item
+    assert_eq!(state.chats_view.active_filter, FeedFilter::All);
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
 
-    // The selection should still point to the review item
-    assert_eq!(state.chats_view.selected_feed_id, Some(state.feed[0].id));
+    // Change filter to Review through the UI (navigate to Filters, press Down to select Review)
+    state.focused = FocusRegion::Filters;
+    let filter_down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    // All(0) -> NeedsReply(1) -> Review(2)
+    update(
+        &mut state,
+        UiEvent::Key(filter_down.clone()),
+        &mut tick_count,
+    );
+    update(
+        &mut state,
+        UiEvent::Key(filter_down.clone()),
+        &mut tick_count,
+    );
+    assert_eq!(state.chats_view.active_filter, FeedFilter::Review);
+
+    // Selection should still point to the review item (WITHOUT navigating)
+    // The review item is still visible with the Review filter
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
+
+    // Change filter back to All - update item should now be visible
+    let filter_up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    update(&mut state, UiEvent::Key(filter_up.clone()), &mut tick_count);
+    update(&mut state, UiEvent::Key(filter_up.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.active_filter, FeedFilter::All);
+
+    // Selection should STILL be on review item (WITHOUT navigating)
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
 }
 
 #[test]
