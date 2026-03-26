@@ -197,18 +197,19 @@ fn update_active_filter(state: &mut AppState) {
         state.chats_view.active_filter = filter.clone();
 
         // Reconcile selected_feed_id against the new filter
-        let filtered: Vec<_> = state
-            .feed
-            .iter()
-            .filter(|item| state.chats_view.active_filter.matches(item))
-            .collect();
+        let filtered = get_filtered_feed(state);
 
         if filtered.is_empty() {
             state.chats_view.selected_feed_id = None;
-        } else if let Some(selected_id) = state.chats_view.selected_feed_id {
-            // Check if selected item is still visible
-            let still_visible = filtered.iter().any(|item| item.id == selected_id);
-            if !still_visible {
+        } else {
+            // Check if current selection is still visible
+            let current_visible = state
+                .chats_view
+                .selected_feed_id
+                .map(|id| filtered.iter().any(|item| item.id == id))
+                .unwrap_or(false);
+
+            if !current_visible {
                 // Select the first visible item
                 state.chats_view.selected_feed_id = Some(filtered[0].id);
             }
@@ -341,11 +342,7 @@ fn parse_composer_input(
     }
 
     // Fallback 1: Route to selected feed item's project (or first visible if no selection)
-    let filtered: Vec<_> = state
-        .feed
-        .iter()
-        .filter(|item| state.chats_view.active_filter.matches(item))
-        .collect();
+    let filtered = get_filtered_feed(state);
 
     if let Some(selected_id) = state.chats_view.selected_feed_id {
         // Use the explicitly selected item

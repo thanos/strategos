@@ -586,7 +586,7 @@ fn test_single_word_routes_to_selected_feed_item() {
 }
 
 #[test]
-fn test_single_word_routes_to_selected_project() {
+fn test_routes_to_selected_project_when_no_feed_context() {
     use strategos::models::ProjectId;
     use strategos::tui::domain::{ProjectState, ProjectStatus};
 
