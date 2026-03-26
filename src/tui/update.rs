@@ -212,14 +212,15 @@ fn handle_input_mode(
         KeyCode::Enter => {
             if !state.composer.input.is_empty() {
                 let input = state.composer.input.clone();
-                state.composer.history.push(input.clone());
-                state.composer.input.clear();
-                state.composer.cursor_position = 0;
-                state.composer.history_index = None;
-                state.mode = UiMode::Normal;
 
                 match parse_composer_input(&input, state) {
                     Some((project, description)) => {
+                        state.composer.history.push(input);
+                        state.composer.input.clear();
+                        state.composer.cursor_position = 0;
+                        state.composer.history_index = None;
+                        state.mode = UiMode::Normal;
+
                         effects.push(Effect::SubmitTask {
                             project,
                             description,

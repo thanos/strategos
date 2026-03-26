@@ -485,3 +485,213 @@ fn test_feed_selection_clamped_on_empty_filter() {
     update(&mut state, UiEvent::Key(down), &mut tick_count);
     assert!(state.chats_view.selected_feed_id.is_none());
 }
+
+#[test]
+fn test_single_word_routes_to_selected_feed_item() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+
+    let project_id = ProjectId::new();
+    let feed_id = FeedItemId::new();
+
+    state.feed = vec![FeedItem {
+        id: feed_id,
+        project_id: project_id.clone(),
+        project_name: "test_project".to_string(),
+        kind: FeedItemKind::Update,
+        summary: "test".to_string(),
+        detail: String::new(),
+        source_backend: None,
+        created_at: chrono::Utc::now(),
+        requires_response: false,
+        resolved: false,
+        unread: true,
+        suggested_actions: vec![],
+        linked_action_id: None,
+        linked_event_ids: vec![],
+    }];
+    state.chats_view.selected_feed_id = Some(feed_id);
+
+    state.composer.input = "hello".to_string();
+    state.composer.cursor_position = 5;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "hello");
+    }
+}
+
+#[test]
+fn test_single_word_routes_to_selected_project() {
+    use strategos::models::ProjectId;
+    use strategos::tui::domain::{ProjectState, ProjectStatus};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+
+    let project_id = ProjectId::new();
+    state.projects = vec![ProjectState {
+        id: project_id.clone(),
+        name: "my_project".to_string(),
+        status: ProjectStatus::Healthy,
+        unread_count: 0,
+        pending_actions: 0,
+        default_backend: None,
+        last_activity: None,
+        budget_percent: 0.0,
+    }];
+    state.chats_view.selected_project_index = 0;
+
+    state.composer.input = "fix the bug".to_string();
+    state.composer.cursor_position = 11;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "fix the bug");
+    }
+}
+
+#[test]
+fn test_routing_fails_shows_error() {
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+    state.projects = vec![];
+    state.chats_view.selected_project_index = 0;
+
+    state.composer.input = "hello".to_string();
+    state.composer.cursor_position = 5;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects.iter().any(|e| matches!(e, Effect::ShowError(_))));
+}
+
+#[test]
+fn test_routing_failure_preserves_input() {
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+    state.projects = vec![];
+
+    state.composer.input = "my unsent message".to_string();
+    state.composer.cursor_position = 17;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let _ = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    // Input should be preserved when routing fails
+    assert_eq!(state.composer.input, "my unsent message");
+    assert_eq!(state.composer.cursor_position, 17);
+    // Should stay in Input mode
+    assert_eq!(state.mode, UiMode::Input);
+}
+
+#[test]
+fn test_explicit_project_prefix_routes_correctly() {
+    use strategos::models::ProjectId;
+    use strategos::tui::domain::{ProjectState, ProjectStatus};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+
+    let project_id = ProjectId::new();
+    state.projects = vec![ProjectState {
+        id: project_id.clone(),
+        name: "frontend".to_string(),
+        status: ProjectStatus::Healthy,
+        unread_count: 0,
+        pending_actions: 0,
+        default_backend: None,
+        last_activity: None,
+        budget_percent: 0.0,
+    }];
+
+    state.composer.input = "frontend fix the header".to_string();
+    state.composer.cursor_position = 23;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "fix the header");
+    }
+}
