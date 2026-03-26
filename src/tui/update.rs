@@ -195,6 +195,24 @@ fn handle_normal_mode(
 fn update_active_filter(state: &mut AppState) {
     if let Some(filter) = FILTERS.get(state.chats_view.selected_filter_index) {
         state.chats_view.active_filter = filter.clone();
+
+        // Reconcile selected_feed_id against the new filter
+        let filtered: Vec<_> = state
+            .feed
+            .iter()
+            .filter(|item| state.chats_view.active_filter.matches(item))
+            .collect();
+
+        if filtered.is_empty() {
+            state.chats_view.selected_feed_id = None;
+        } else if let Some(selected_id) = state.chats_view.selected_feed_id {
+            // Check if selected item is still visible
+            let still_visible = filtered.iter().any(|item| item.id == selected_id);
+            if !still_visible {
+                // Select the first visible item
+                state.chats_view.selected_feed_id = Some(filtered[0].id);
+            }
+        }
     }
 }
 
@@ -322,11 +340,23 @@ fn parse_composer_input(
         }
     }
 
-    // Fallback 1: Route to selected feed item's project
+    // Fallback 1: Route to selected feed item's project (or first visible if no selection)
+    let filtered: Vec<_> = state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item))
+        .collect();
+
     if let Some(selected_id) = state.chats_view.selected_feed_id {
-        if let Some(item) = state.feed.iter().find(|i| i.id == selected_id) {
+        // Use the explicitly selected item
+        if let Some(item) = filtered.iter().find(|i| i.id == selected_id) {
             return Some((item.project_id.clone(), input.to_string()));
         }
+    }
+
+    // If no selection, use the first visible item
+    if let Some(first_item) = filtered.first() {
+        return Some((first_item.project_id.clone(), input.to_string()));
     }
 
     // Fallback 2: Route to selected project in sidebar

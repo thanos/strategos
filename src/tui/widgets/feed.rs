@@ -21,19 +21,17 @@ pub fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    // Resolve ID to filtered index, default to 0 if not found
+    // Resolve ID to filtered index, None if not found or no selection
     let selected_idx = state
         .chats_view
         .selected_feed_id
-        .and_then(|id| filtered.iter().position(|item| item.id == id))
-        .unwrap_or(0)
-        .min(filtered.len() - 1);
+        .and_then(|id| filtered.iter().position(|item| item.id == id));
 
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let selected = i == selected_idx;
+            let selected = Some(i) == selected_idx;
             let style = if selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else if item.unread {
@@ -56,7 +54,7 @@ pub fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
 
     let list = List::new(items);
     let mut list_state = ListState::default();
-    list_state.select(Some(selected_idx));
+    list_state.select(selected_idx);
 
     f.render_stateful_widget(list, area, &mut list_state);
 }
