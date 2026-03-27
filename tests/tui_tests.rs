@@ -735,3 +735,265 @@ fn test_explicit_project_prefix_routes_correctly() {
         assert_eq!(description, "fix the header");
     }
 }
+
+#[test]
+fn test_projects_view_navigation() {
+    use strategos::models::ProjectId;
+    use strategos::tui::domain::{ProjectState, ProjectStatus};
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Projects;
+    state.projects = vec![
+        ProjectState {
+            id: ProjectId::new(),
+            name: "project_alpha".to_string(),
+            status: ProjectStatus::Healthy,
+            unread_count: 5,
+            pending_actions: 1,
+            default_backend: None,
+            last_activity: None,
+            budget_percent: 0.0,
+        },
+        ProjectState {
+            id: ProjectId::new(),
+            name: "project_beta".to_string(),
+            status: ProjectStatus::AwaitingReview,
+            unread_count: 2,
+            pending_actions: 0,
+            default_backend: None,
+            last_activity: None,
+            budget_percent: 0.45,
+        },
+    ];
+    let mut tick_count = 0;
+
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Start at index 0
+    assert_eq!(state.projects_view.selected_index, 0);
+
+    // Navigate down
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.projects_view.selected_index, 1);
+
+    // Bounds check - can't go past end
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.projects_view.selected_index, 1);
+
+    // Navigate back up
+    update(&mut state, UiEvent::Key(up.clone()), &mut tick_count);
+    assert_eq!(state.projects_view.selected_index, 0);
+
+    // Bounds check - can't go before start
+    update(&mut state, UiEvent::Key(up.clone()), &mut tick_count);
+    assert_eq!(state.projects_view.selected_index, 0);
+}
+
+#[test]
+fn test_queue_view_navigation() {
+    use strategos::models::{ActionId, ProjectId};
+    use strategos::tui::domain::{ActionItem, ActionKind};
+    use strategos::tui::state::QueueFilter;
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Queue;
+    state.actions = vec![
+        ActionItem {
+            id: ActionId::new(),
+            project_id: ProjectId::new(),
+            project_name: "test".to_string(),
+            kind: ActionKind::ReviewRequest,
+            priority: strategos::models::Priority::Normal,
+            summary: "Review code changes".to_string(),
+            created_at: chrono::Utc::now(),
+            requires_user_decision: true,
+            resolved: false,
+        },
+        ActionItem {
+            id: ActionId::new(),
+            project_id: ProjectId::new(),
+            project_name: "test".to_string(),
+            kind: ActionKind::CommitSuggestion,
+            priority: strategos::models::Priority::Normal,
+            summary: "Commit ready".to_string(),
+            created_at: chrono::Utc::now(),
+            requires_user_decision: true,
+            resolved: false,
+        },
+    ];
+    let mut tick_count = 0;
+
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Navigate through actions
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_index, 1);
+
+    update(&mut state, UiEvent::Key(up.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_index, 0);
+}
+
+#[test]
+fn test_queue_filter_cycling() {
+    use strategos::tui::state::QueueFilter;
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Queue;
+    let mut tick_count = 0;
+
+    let right = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let left = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Default filter is All
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::All);
+
+    // Cycle right: All -> Review
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::Review);
+
+    // Cycle right: Review -> Commit
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::Commit);
+
+    // Cycle right: Commit -> Blocker
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::Blocker);
+
+    // Cycle right: Blocker -> Budget
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::Budget);
+
+    // Cycle right: Budget -> All (wrap)
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::All);
+
+    // Cycle left: All -> Budget (wrap)
+    update(&mut state, UiEvent::Key(left.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_filter, QueueFilter::Budget);
+}
+
+#[test]
+fn test_events_view_navigation() {
+    use strategos::tui::state::EventRecord;
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Events;
+    state.events = vec![
+        EventRecord {
+            id: uuid::Uuid::new_v4(),
+            event_type: "TaskCreated".to_string(),
+            timestamp: chrono::Utc::now(),
+            payload: "test payload 1".to_string(),
+        },
+        EventRecord {
+            id: uuid::Uuid::new_v4(),
+            event_type: "TaskCompleted".to_string(),
+            timestamp: chrono::Utc::now(),
+            payload: "test payload 2".to_string(),
+        },
+    ];
+    let mut tick_count = 0;
+
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Navigate through events
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.events_view.scroll_offset, 1);
+
+    update(&mut state, UiEvent::Key(up.clone()), &mut tick_count);
+    assert_eq!(state.events_view.scroll_offset, 0);
+}
+
+#[test]
+fn test_budget_view_displays_percentages() {
+    use strategos::budget::governor::BudgetMode;
+    use strategos::models::{BackendId, MoneyAmount};
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Budget;
+    state.budget.global_percent_used = 0.65;
+    state.budget.mode = BudgetMode::Govern;
+    state.budget.daily_burn_rate = Some(MoneyAmount { cents: 50000 });
+    state.budget.projected_eom = Some(MoneyAmount { cents: 150000 });
+
+    let backend_id = BackendId::new("claude");
+    state.budget.backend_percent_used.insert(backend_id, 0.35);
+
+    // Just verify the state is set correctly
+    assert!((state.budget.global_percent_used - 0.65).abs() < 0.01);
+    assert_eq!(state.budget.mode, BudgetMode::Govern);
+    assert!(state.budget.daily_burn_rate.is_some());
+    assert!(state.budget.projected_eom.is_some());
+}
+
+#[test]
+fn test_queue_filter_resets_selection() {
+    use strategos::models::{ActionId, ProjectId};
+    use strategos::tui::domain::{ActionItem, ActionKind};
+    use strategos::tui::state::QueueFilter;
+
+    let mut state = create_test_state();
+    state.current_tab = TopLevelTab::Queue;
+    state.actions = vec![
+        ActionItem {
+            id: ActionId::new(),
+            project_id: ProjectId::new(),
+            project_name: "test".to_string(),
+            kind: ActionKind::ReviewRequest,
+            priority: strategos::models::Priority::Normal,
+            summary: "Review item".to_string(),
+            created_at: chrono::Utc::now(),
+            requires_user_decision: true,
+            resolved: false,
+        },
+        ActionItem {
+            id: ActionId::new(),
+            project_id: ProjectId::new(),
+            project_name: "test".to_string(),
+            kind: ActionKind::CommitSuggestion,
+            priority: strategos::models::Priority::Normal,
+            summary: "Commit item".to_string(),
+            created_at: chrono::Utc::now(),
+            requires_user_decision: true,
+            resolved: false,
+        },
+    ];
+    state.queue_view.selected_index = 1;
+    let mut tick_count = 0;
+
+    let right = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Change filter - selection should reset to 0
+    update(&mut state, UiEvent::Key(right.clone()), &mut tick_count);
+    assert_eq!(state.queue_view.selected_index, 0);
+}

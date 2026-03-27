@@ -127,11 +127,136 @@ fn find_prev_visible_feed_item(
     }
 }
 
-fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> Option<usize> {
+fn handle_navigation_down(state: &mut AppState) {
+    match state.current_tab {
+        TopLevelTab::Chats => match state.focused {
+            FocusRegion::Projects => {
+                if state.chats_view.selected_project_index < state.projects.len().saturating_sub(1)
+                {
+                    state.chats_view.selected_project_index += 1;
+                }
+            }
+            FocusRegion::Filters => {
+                if state.chats_view.selected_filter_index < FILTERS.len() - 1 {
+                    state.chats_view.selected_filter_index += 1;
+                    update_active_filter(state);
+                }
+            }
+            FocusRegion::Feed => {
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_next_visible_feed_item(state, current_id);
+            }
+            _ => {}
+        },
+        TopLevelTab::Projects => {
+            if state.projects_view.selected_index < state.projects.len().saturating_sub(1) {
+                state.projects_view.selected_index += 1;
+            }
+        }
+        TopLevelTab::Queue => {
+            let count = count_filtered_actions(state);
+            if count > 0 && state.queue_view.selected_index < count - 1 {
+                state.queue_view.selected_index += 1;
+            }
+        }
+        TopLevelTab::Budget => {}
+        TopLevelTab::Events => {
+            if state.events_view.scroll_offset < state.events.len().saturating_sub(1) {
+                state.events_view.scroll_offset += 1;
+            }
+        }
+    }
+}
+
+fn handle_navigation_up(state: &mut AppState) {
+    match state.current_tab {
+        TopLevelTab::Chats => match state.focused {
+            FocusRegion::Projects => {
+                if state.chats_view.selected_project_index > 0 {
+                    state.chats_view.selected_project_index -= 1;
+                }
+            }
+            FocusRegion::Filters => {
+                if state.chats_view.selected_filter_index > 0 {
+                    state.chats_view.selected_filter_index -= 1;
+                    update_active_filter(state);
+                }
+            }
+            FocusRegion::Feed => {
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_prev_visible_feed_item(state, current_id);
+            }
+            _ => {}
+        },
+        TopLevelTab::Projects => {
+            if state.projects_view.selected_index > 0 {
+                state.projects_view.selected_index -= 1;
+            }
+        }
+        TopLevelTab::Queue => {
+            if state.queue_view.selected_index > 0 {
+                state.queue_view.selected_index -= 1;
+            }
+        }
+        TopLevelTab::Budget => {}
+        TopLevelTab::Events => {
+            if state.events_view.scroll_offset > 0 {
+                state.events_view.scroll_offset -= 1;
+            }
+        }
+    }
+}
+
+fn count_filtered_actions(state: &AppState) -> usize {
     state
-        .chats_view
-        .selected_feed_id
-        .and_then(|id| filtered.iter().position(|item| item.id == id))
+        .actions
+        .iter()
+        .filter(|a| !a.resolved && action_matches_filter(a.kind, state.queue_view.selected_filter))
+        .count()
+}
+
+fn action_matches_filter(
+    kind: crate::tui::domain::ActionKind,
+    filter: crate::tui::state::QueueFilter,
+) -> bool {
+    use crate::tui::domain::ActionKind;
+    use crate::tui::state::QueueFilter;
+
+    match filter {
+        QueueFilter::All => true,
+        QueueFilter::Review => kind == ActionKind::ReviewRequest,
+        QueueFilter::Commit => kind == ActionKind::CommitSuggestion,
+        QueueFilter::Blocker => kind == ActionKind::Blocker,
+        QueueFilter::Budget => kind == ActionKind::BudgetApproval,
+    }
+}
+
+fn cycle_queue_filter_left(state: &mut AppState) {
+    use crate::tui::state::QueueFilter;
+
+    let new_filter = match state.queue_view.selected_filter {
+        QueueFilter::All => QueueFilter::Budget,
+        QueueFilter::Review => QueueFilter::All,
+        QueueFilter::Commit => QueueFilter::Review,
+        QueueFilter::Blocker => QueueFilter::Commit,
+        QueueFilter::Budget => QueueFilter::Blocker,
+    };
+    state.queue_view.selected_filter = new_filter;
+    state.queue_view.selected_index = 0;
+}
+
+fn cycle_queue_filter_right(state: &mut AppState) {
+    use crate::tui::state::QueueFilter;
+
+    let new_filter = match state.queue_view.selected_filter {
+        QueueFilter::All => QueueFilter::Review,
+        QueueFilter::Review => QueueFilter::Commit,
+        QueueFilter::Commit => QueueFilter::Blocker,
+        QueueFilter::Blocker => QueueFilter::Budget,
+        QueueFilter::Budget => QueueFilter::All,
+    };
+    state.queue_view.selected_filter = new_filter;
+    state.queue_view.selected_index = 0;
 }
 
 fn handle_normal_mode(
@@ -170,43 +295,12 @@ fn handle_normal_mode(
                 FocusRegion::Composer => FocusRegion::Feed,
             };
         }
-        KeyCode::Char('j') | KeyCode::Down => match state.focused {
-            FocusRegion::Projects => {
-                if state.chats_view.selected_project_index < state.projects.len().saturating_sub(1)
-                {
-                    state.chats_view.selected_project_index += 1;
-                }
-            }
-            FocusRegion::Filters => {
-                if state.chats_view.selected_filter_index < FILTERS.len() - 1 {
-                    state.chats_view.selected_filter_index += 1;
-                    update_active_filter(state);
-                }
-            }
-            FocusRegion::Feed => {
-                let current_id = state.chats_view.selected_feed_id;
-                state.chats_view.selected_feed_id = find_next_visible_feed_item(state, current_id);
-            }
-            _ => {}
-        },
-        KeyCode::Char('k') | KeyCode::Up => match state.focused {
-            FocusRegion::Projects => {
-                if state.chats_view.selected_project_index > 0 {
-                    state.chats_view.selected_project_index -= 1;
-                }
-            }
-            FocusRegion::Filters => {
-                if state.chats_view.selected_filter_index > 0 {
-                    state.chats_view.selected_filter_index -= 1;
-                    update_active_filter(state);
-                }
-            }
-            FocusRegion::Feed => {
-                let current_id = state.chats_view.selected_feed_id;
-                state.chats_view.selected_feed_id = find_prev_visible_feed_item(state, current_id);
-            }
-            _ => {}
-        },
+        KeyCode::Char('j') | KeyCode::Down => {
+            handle_navigation_down(state);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            handle_navigation_up(state);
+        }
         KeyCode::Char('i') => {
             state.mode = UiMode::Input;
             state.focused = FocusRegion::Composer;
@@ -214,6 +308,16 @@ fn handle_normal_mode(
         KeyCode::Enter => {
             if state.focused == FocusRegion::Feed {
                 state.mode = UiMode::Detail;
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if state.current_tab == TopLevelTab::Queue {
+                cycle_queue_filter_left(state);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            if state.current_tab == TopLevelTab::Queue {
+                cycle_queue_filter_right(state);
             }
         }
         KeyCode::Esc => {
