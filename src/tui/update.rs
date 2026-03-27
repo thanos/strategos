@@ -78,6 +78,55 @@ fn get_filtered_feed<'a>(state: &'a AppState) -> Vec<&'a FeedItem> {
         .collect()
 }
 
+fn find_next_visible_feed_item(
+    state: &AppState,
+    current_id: Option<crate::tui::feed::FeedItemId>,
+) -> Option<crate::tui::feed::FeedItemId> {
+    let mut filtered = state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item));
+
+    match current_id {
+        None => filtered.next().map(|i| i.id),
+        Some(id) => {
+            let mut found_current = false;
+            for item in filtered {
+                if found_current {
+                    return Some(item.id);
+                }
+                if item.id == id {
+                    found_current = true;
+                }
+            }
+            None
+        }
+    }
+}
+
+fn find_prev_visible_feed_item(
+    state: &AppState,
+    current_id: Option<crate::tui::feed::FeedItemId>,
+) -> Option<crate::tui::feed::FeedItemId> {
+    let filtered: Vec<_> = state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item))
+        .collect();
+
+    match current_id {
+        None => filtered.first().map(|i| i.id),
+        Some(id) => {
+            let pos = filtered.iter().position(|item| item.id == id);
+            match pos {
+                None => filtered.first().map(|i| i.id),
+                Some(0) => filtered.first().map(|i| i.id),
+                Some(idx) => filtered.get(idx - 1).map(|i| i.id),
+            }
+        }
+    }
+}
+
 fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> Option<usize> {
     state
         .chats_view
@@ -135,17 +184,8 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                let filtered = get_filtered_feed(state);
-                if filtered.is_empty() {
-                    state.chats_view.selected_feed_id = None;
-                } else {
-                    let current_idx = resolve_feed_index(state, &filtered);
-                    let new_idx = match current_idx {
-                        Some(idx) => (idx + 1).min(filtered.len() - 1),
-                        None => 0,
-                    };
-                    state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
-                }
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_next_visible_feed_item(state, current_id);
             }
             _ => {}
         },
@@ -162,17 +202,8 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                let filtered = get_filtered_feed(state);
-                if filtered.is_empty() {
-                    state.chats_view.selected_feed_id = None;
-                } else {
-                    let current_idx = resolve_feed_index(state, &filtered);
-                    let new_idx = match current_idx {
-                        Some(idx) => idx.saturating_sub(1),
-                        None => 0,
-                    };
-                    state.chats_view.selected_feed_id = Some(filtered[new_idx].id);
-                }
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_prev_visible_feed_item(state, current_id);
             }
             _ => {}
         },
