@@ -1,4 +1,4 @@
-use crate::models::{ActionId, BackendId, EventId, ProjectId, TaskId};
+use crate::models::{ActionId, BackendId, EventId, ProjectId};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ impl FeedFilter {
             FeedFilter::Blocked => "blocked",
             FeedFilter::Budget => "budget",
             FeedFilter::Unread => "unread",
-            FeedFilter::Project(id) => "project",
+            FeedFilter::Project(_) => "project",
         }
     }
 
