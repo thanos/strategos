@@ -2,7 +2,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 
 use crate::tui::event::{Effect, UiEvent};
-use crate::tui::feed::FeedFilter;
+use crate::tui::feed::{FeedFilter, FeedItem};
 use crate::tui::state::AppState;
 use crate::tui::types::{FocusRegion, TopLevelTab, UiMode};
 use crate::tui::views;
@@ -70,6 +70,70 @@ pub fn update(state: &mut AppState, event: UiEvent, tick_count: &mut u32) -> Vec
     effects
 }
 
+fn get_filtered_feed<'a>(state: &'a AppState) -> Vec<&'a FeedItem> {
+    state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item))
+        .collect()
+}
+
+fn find_next_visible_feed_item(
+    state: &AppState,
+    current_id: Option<crate::tui::feed::FeedItemId>,
+) -> Option<crate::tui::feed::FeedItemId> {
+    let mut filtered = state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item));
+
+    match current_id {
+        None => filtered.next().map(|i| i.id),
+        Some(id) => {
+            let mut found_current = false;
+            for item in filtered {
+                if found_current {
+                    return Some(item.id);
+                }
+                if item.id == id {
+                    found_current = true;
+                }
+            }
+            None
+        }
+    }
+}
+
+fn find_prev_visible_feed_item(
+    state: &AppState,
+    current_id: Option<crate::tui::feed::FeedItemId>,
+) -> Option<crate::tui::feed::FeedItemId> {
+    let filtered: Vec<_> = state
+        .feed
+        .iter()
+        .filter(|item| state.chats_view.active_filter.matches(item))
+        .collect();
+
+    match current_id {
+        None => filtered.first().map(|i| i.id),
+        Some(id) => {
+            let pos = filtered.iter().position(|item| item.id == id);
+            match pos {
+                None => filtered.first().map(|i| i.id),
+                Some(0) => filtered.first().map(|i| i.id),
+                Some(idx) => filtered.get(idx - 1).map(|i| i.id),
+            }
+        }
+    }
+}
+
+fn resolve_feed_index(state: &AppState, filtered: &[&FeedItem]) -> Option<usize> {
+    state
+        .chats_view
+        .selected_feed_id
+        .and_then(|id| filtered.iter().position(|item| item.id == id))
+}
+
 fn handle_normal_mode(
     state: &mut AppState,
     key: crossterm::event::KeyEvent,
@@ -120,10 +184,8 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                let feed_len = state.feed.len();
-                if feed_len > 0 && state.chats_view.selected_feed_index < feed_len - 1 {
-                    state.chats_view.selected_feed_index += 1;
-                }
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_next_visible_feed_item(state, current_id);
             }
             _ => {}
         },
@@ -140,9 +202,8 @@ fn handle_normal_mode(
                 }
             }
             FocusRegion::Feed => {
-                if state.chats_view.selected_feed_index > 0 {
-                    state.chats_view.selected_feed_index -= 1;
-                }
+                let current_id = state.chats_view.selected_feed_id;
+                state.chats_view.selected_feed_id = find_prev_visible_feed_item(state, current_id);
             }
             _ => {}
         },
@@ -165,6 +226,25 @@ fn handle_normal_mode(
 fn update_active_filter(state: &mut AppState) {
     if let Some(filter) = FILTERS.get(state.chats_view.selected_filter_index) {
         state.chats_view.active_filter = filter.clone();
+
+        // Reconcile selected_feed_id against the new filter
+        let filtered = get_filtered_feed(state);
+
+        if filtered.is_empty() {
+            state.chats_view.selected_feed_id = None;
+        } else {
+            // Check if current selection is still visible
+            let current_visible = state
+                .chats_view
+                .selected_feed_id
+                .map(|id| filtered.iter().any(|item| item.id == id))
+                .unwrap_or(false);
+
+            if !current_visible {
+                // Select the first visible item
+                state.chats_view.selected_feed_id = Some(filtered[0].id);
+            }
+        }
     }
 }
 
@@ -183,17 +263,25 @@ fn handle_input_mode(
         KeyCode::Enter => {
             if !state.composer.input.is_empty() {
                 let input = state.composer.input.clone();
-                state.composer.history.push(input.clone());
-                state.composer.input.clear();
-                state.composer.cursor_position = 0;
-                state.composer.history_index = None;
-                state.mode = UiMode::Normal;
 
-                if let Some((project, description)) = parse_composer_input(&input, state) {
-                    effects.push(Effect::SubmitTask {
-                        project,
-                        description,
-                    });
+                match parse_composer_input(&input, state) {
+                    Some((project, description)) => {
+                        state.composer.history.push(input);
+                        state.composer.input.clear();
+                        state.composer.cursor_position = 0;
+                        state.composer.history_index = None;
+                        state.mode = UiMode::Normal;
+
+                        effects.push(Effect::SubmitTask {
+                            project,
+                            description,
+                        });
+                    }
+                    None => {
+                        effects.push(Effect::ShowError(
+                            "No project context available. Select a project or use 'project_name message' format.".to_string()
+                        ));
+                    }
                 }
             }
         }
@@ -273,22 +361,33 @@ fn parse_composer_input(
     input: &str,
     state: &AppState,
 ) -> Option<(crate::models::ProjectId, String)> {
-    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-    if parts.len() < 2 {
-        return None;
+    // Try to find an explicit project prefix (word followed by space)
+    if let Some(space_pos) = input.find(' ') {
+        let potential_project = &input[..space_pos];
+        let description = input[space_pos + 1..].to_string();
+
+        // Check if first word matches a project name
+        if let Some(project) = state.projects.iter().find(|p| p.name == potential_project) {
+            return Some((project.id.clone(), description));
+        }
     }
 
-    let potential_project = parts[0];
-    let description = parts[1].to_string();
+    // Fallback 1: Route to selected feed item's project (or first visible if no selection)
+    let filtered = get_filtered_feed(state);
 
-    if let Some(project) = state.projects.iter().find(|p| p.name == potential_project) {
-        return Some((project.id.clone(), description));
+    if let Some(selected_id) = state.chats_view.selected_feed_id {
+        // Use the explicitly selected item
+        if let Some(item) = filtered.iter().find(|i| i.id == selected_id) {
+            return Some((item.project_id.clone(), input.to_string()));
+        }
     }
 
-    if let Some(item) = state.feed.get(state.chats_view.selected_feed_index) {
-        return Some((item.project_id.clone(), input.to_string()));
+    // If no selection, use the first visible item
+    if let Some(first_item) = filtered.first() {
+        return Some((first_item.project_id.clone(), input.to_string()));
     }
 
+    // Fallback 2: Route to selected project in sidebar
     if let Some(project) = state.projects.get(state.chats_view.selected_project_index) {
         return Some((project.id.clone(), input.to_string()));
     }

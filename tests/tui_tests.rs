@@ -83,8 +83,8 @@ fn test_help_ignores_other_keys() {
     update(&mut state, UiEvent::Key(other_key), &mut tick_count);
     assert!(state.show_help);
 
-    // Selected index should not change
-    assert_eq!(state.chats_view.selected_feed_index, 0);
+    // Selected feed ID should not change (should remain None since no feed items)
+    assert!(state.chats_view.selected_feed_id.is_none());
 }
 
 #[test]
@@ -330,4 +330,408 @@ fn test_throttled_refresh() {
     let effects = update(&mut state, UiEvent::Tick, &mut tick_count);
     assert!(effects.iter().any(|e| matches!(e, Effect::RefreshState)));
     assert_eq!(tick_count, 0);
+}
+
+#[test]
+fn test_feed_selection_persists_across_filter_change() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
+    let project_id = ProjectId::new();
+
+    let review_id = FeedItemId::new();
+    let update_id = FeedItemId::new();
+
+    state.feed = vec![
+        FeedItem {
+            id: review_id,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review item".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: update_id,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::Update,
+            summary: "update item".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: false,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+    ];
+
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Filter is All by default, navigate to select the review item
+    assert_eq!(state.chats_view.active_filter, FeedFilter::All);
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
+
+    // Change filter to Review through the UI (navigate to Filters, press Down to select Review)
+    state.focused = FocusRegion::Filters;
+    let filter_down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    // All(0) -> NeedsReply(1) -> Review(2)
+    update(
+        &mut state,
+        UiEvent::Key(filter_down.clone()),
+        &mut tick_count,
+    );
+    update(
+        &mut state,
+        UiEvent::Key(filter_down.clone()),
+        &mut tick_count,
+    );
+    assert_eq!(state.chats_view.active_filter, FeedFilter::Review);
+
+    // Selection should still point to the review item (WITHOUT navigating)
+    // The review item is still visible with the Review filter
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
+
+    // Change filter back to All - update item should now be visible
+    let filter_up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    update(&mut state, UiEvent::Key(filter_up.clone()), &mut tick_count);
+    update(&mut state, UiEvent::Key(filter_up.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.active_filter, FeedFilter::All);
+
+    // Selection should STILL be on review item (WITHOUT navigating)
+    assert_eq!(state.chats_view.selected_feed_id, Some(review_id));
+}
+
+#[test]
+fn test_feed_navigation_respects_active_filter() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
+    let project_id = ProjectId::new();
+
+    let id1 = FeedItemId::new();
+    let id2 = FeedItemId::new();
+    let id3 = FeedItemId::new();
+
+    state.feed = vec![
+        FeedItem {
+            id: id1,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review 1".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: id2,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::Update,
+            summary: "update 1".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: false,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+        FeedItem {
+            id: id3,
+            project_id: project_id.clone(),
+            project_name: "test".to_string(),
+            kind: FeedItemKind::ReviewRequest,
+            summary: "review 2".to_string(),
+            detail: String::new(),
+            source_backend: None,
+            created_at: chrono::Utc::now(),
+            requires_response: true,
+            resolved: false,
+            unread: true,
+            suggested_actions: vec![],
+            linked_action_id: None,
+            linked_event_ids: vec![],
+        },
+    ];
+
+    // Filter to only show Review items
+    state.chats_view.active_filter = FeedFilter::Review;
+
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Should select first review item
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(id1));
+
+    // Should skip update item and go to second review item
+    update(&mut state, UiEvent::Key(down.clone()), &mut tick_count);
+    assert_eq!(state.chats_view.selected_feed_id, Some(id3));
+}
+
+#[test]
+fn test_feed_selection_clamped_on_empty_filter() {
+    let mut state = create_test_state();
+    state.focused = FocusRegion::Feed;
+    state.feed = vec![];
+    state.chats_view.selected_feed_id = None;
+
+    let mut tick_count = 0;
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // Should handle gracefully without panic
+    update(&mut state, UiEvent::Key(down), &mut tick_count);
+    assert!(state.chats_view.selected_feed_id.is_none());
+}
+
+#[test]
+fn test_single_word_routes_to_selected_feed_item() {
+    use strategos::models::ProjectId;
+    use strategos::tui::feed::{FeedItem, FeedItemId, FeedItemKind};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+
+    let project_id = ProjectId::new();
+    let feed_id = FeedItemId::new();
+
+    state.feed = vec![FeedItem {
+        id: feed_id,
+        project_id: project_id.clone(),
+        project_name: "test_project".to_string(),
+        kind: FeedItemKind::Update,
+        summary: "test".to_string(),
+        detail: String::new(),
+        source_backend: None,
+        created_at: chrono::Utc::now(),
+        requires_response: false,
+        resolved: false,
+        unread: true,
+        suggested_actions: vec![],
+        linked_action_id: None,
+        linked_event_ids: vec![],
+    }];
+    state.chats_view.selected_feed_id = Some(feed_id);
+
+    state.composer.input = "hello".to_string();
+    state.composer.cursor_position = 5;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "hello");
+    }
+}
+
+#[test]
+fn test_routes_to_selected_project_when_no_feed_context() {
+    use strategos::models::ProjectId;
+    use strategos::tui::domain::{ProjectState, ProjectStatus};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+
+    let project_id = ProjectId::new();
+    state.projects = vec![ProjectState {
+        id: project_id.clone(),
+        name: "my_project".to_string(),
+        status: ProjectStatus::Healthy,
+        unread_count: 0,
+        pending_actions: 0,
+        default_backend: None,
+        last_activity: None,
+        budget_percent: 0.0,
+    }];
+    state.chats_view.selected_project_index = 0;
+
+    state.composer.input = "fix the bug".to_string();
+    state.composer.cursor_position = 11;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "fix the bug");
+    }
+}
+
+#[test]
+fn test_routing_fails_shows_error() {
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+    state.projects = vec![];
+    state.chats_view.selected_project_index = 0;
+
+    state.composer.input = "hello".to_string();
+    state.composer.cursor_position = 5;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects.iter().any(|e| matches!(e, Effect::ShowError(_))));
+}
+
+#[test]
+fn test_routing_failure_preserves_input() {
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+    state.chats_view.selected_feed_id = None;
+    state.projects = vec![];
+
+    state.composer.input = "my unsent message".to_string();
+    state.composer.cursor_position = 17;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let _ = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    // Input should be preserved when routing fails
+    assert_eq!(state.composer.input, "my unsent message");
+    assert_eq!(state.composer.cursor_position, 17);
+    // Should stay in Input mode
+    assert_eq!(state.mode, UiMode::Input);
+}
+
+#[test]
+fn test_explicit_project_prefix_routes_correctly() {
+    use strategos::models::ProjectId;
+    use strategos::tui::domain::{ProjectState, ProjectStatus};
+
+    let mut state = create_test_state();
+    state.mode = UiMode::Input;
+    state.focused = FocusRegion::Composer;
+
+    let project_id = ProjectId::new();
+    state.projects = vec![ProjectState {
+        id: project_id.clone(),
+        name: "frontend".to_string(),
+        status: ProjectStatus::Healthy,
+        unread_count: 0,
+        pending_actions: 0,
+        default_backend: None,
+        last_activity: None,
+        budget_percent: 0.0,
+    }];
+
+    state.composer.input = "frontend fix the header".to_string();
+    state.composer.cursor_position = 23;
+
+    let mut tick_count = 0;
+    let enter = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    let effects = update(&mut state, UiEvent::Key(enter), &mut tick_count);
+
+    assert!(effects
+        .iter()
+        .any(|e| matches!(e, Effect::SubmitTask { .. })));
+
+    let submit_task = effects.iter().find_map(|e| match e {
+        Effect::SubmitTask {
+            project,
+            description,
+        } => Some((project.clone(), description.clone())),
+        _ => None,
+    });
+
+    if let Some((project, description)) = submit_task {
+        assert_eq!(project, project_id);
+        assert_eq!(description, "fix the header");
+    }
 }

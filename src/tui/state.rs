@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::tui::domain::ActionItem;
 use crate::tui::domain::{BudgetState, ProjectState, RoutingState};
-use crate::tui::feed::{FeedFilter, FeedItem};
+use crate::tui::feed::{FeedFilter, FeedItem, FeedItemId};
 use crate::tui::types::{FocusRegion, TopLevelTab, UiMode};
 
 pub struct AppState {
@@ -201,7 +201,7 @@ pub struct ComposerState {
 pub struct ChatsViewState {
     pub selected_project_index: usize,
     pub selected_filter_index: usize,
-    pub selected_feed_index: usize,
+    pub selected_feed_id: Option<FeedItemId>,
     pub feed_scroll_offset: usize,
     pub project_scope: Option<crate::models::ProjectId>,
     pub active_filter: FeedFilter,

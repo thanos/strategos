@@ -7,7 +7,7 @@ use ratatui::{
 
 use crate::tui::state::AppState;
 
-pub fn render_feed(f: &mut Frame, area: Rect, state: &mut AppState) {
+pub fn render_feed(f: &mut Frame, area: Rect, state: &AppState) {
     let filtered: Vec<_> = state
         .feed
         .iter()
@@ -21,11 +21,17 @@ pub fn render_feed(f: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
+    // Resolve ID to filtered index, None if not found or no selection
+    let selected_idx = state
+        .chats_view
+        .selected_feed_id
+        .and_then(|id| filtered.iter().position(|item| item.id == id));
+
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let selected = i == state.chats_view.selected_feed_index;
+            let selected = Some(i) == selected_idx;
             let style = if selected {
                 Style::default().add_modifier(Modifier::BOLD)
             } else if item.unread {
@@ -48,11 +54,7 @@ pub fn render_feed(f: &mut Frame, area: Rect, state: &mut AppState) {
 
     let list = List::new(items);
     let mut list_state = ListState::default();
-    list_state.select(if filtered.is_empty() {
-        None
-    } else {
-        Some(state.chats_view.selected_feed_index.min(filtered.len() - 1))
-    });
+    list_state.select(selected_idx);
 
     f.render_stateful_widget(list, area, &mut list_state);
 }
